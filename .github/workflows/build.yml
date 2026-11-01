@@ -6,9 +6,11 @@ on:
       - "**.md"
     branches:
       - main
+      - sigret
   pull_request:
     branches:
       - main
+      - sigret
   workflow_dispatch:
 
 concurrency:
@@ -74,7 +76,7 @@ jobs:
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
       - name: Decode Android signing key
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && secrets.SIGNING_KEY != '' }}
         run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
 
       - name: Build Ghostlock binary
@@ -235,7 +237,7 @@ jobs:
     name: Pre-release
     needs: [build-apk, build-extractor-macos, build-extractor-windows]
     runs-on: ubuntu-latest
-    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
+    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && github.ref_type != 'tag' }}
     permissions:
       contents: write
     steps:
@@ -343,7 +345,7 @@ jobs:
   post_telegram:
     needs: [build-apk, build-extractor-macos, build-extractor-windows]
     runs-on: ubuntu-latest
-    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
+    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && github.ref_type != 'tag' && secrets.BOT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v7
         with:
