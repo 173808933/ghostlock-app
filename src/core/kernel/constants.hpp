@@ -5,6 +5,11 @@
 
 #include "kernel/offset.h"
 
+/* NDK r27's <bits/page_size.h> defines a PAGE_SIZE macro that collides with
+ * the kernel page-size constant below. Undefine it so the constant wins; the
+ * macro is never intended to be used here. */
+#undef PAGE_SIZE
+
 namespace ghostlock::kernel {
     inline constexpr unsigned PAGE_SHIFT = 12;
     inline constexpr unsigned long PAGE_SIZE = 1UL << PAGE_SHIFT;

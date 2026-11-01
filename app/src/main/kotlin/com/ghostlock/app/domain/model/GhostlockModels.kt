@@ -77,6 +77,8 @@ data class ProfileConfig(
     val general: List<ExecutionFieldValue> = emptyList(),
     /** Explicit route from the profile; null means geometry inference. */
     val route: String? = null,
+    /** Copy primitive the profile declares ("sigret"/null); null = route default. */
+    val punch: String? = null,
     /** Declared fallback route ("none"/"<route>"); null means unset. */
     val fallbackTo: String? = null,
     /** Dotted paths whose resolved value violates the geometry rules. */
@@ -134,6 +136,22 @@ sealed interface OffsetImportResult {
     data class Failed(val reason: String) : OffsetImportResult
 }
 
+/** Verdict produced by the extractor's own analysis pass (`--analysis-json`). */
+data class ParseVerdict(
+    /** usable | risky | unusable */
+    val level: String,
+    /** Route the profile was built for, e.g. sigret / multicast_waiter. */
+    val route: String?,
+    /** Punch the native binary must use: sigret or setsockopt. */
+    val punch: String?,
+    val release: String?,
+    val waiterOff: Long? = null,
+    val depth: Long? = null,
+    val d: Long? = null,
+    val buffer: Long? = null,
+    val reasons: List<String> = emptyList(),
+)
+
 sealed interface ParseResult {
     /** Fields only an xbl_config/uefi sidecar can supply (e.g.
      * `kernel_phys_load`) that the parsed profile is still missing. */
@@ -142,11 +160,19 @@ sealed interface ParseResult {
         val missing: Set<String> = emptySet(),
         /** Name of the stored document, so the caller can auto-load it. */
         val documentName: String? = null,
+        /** Extractor verdict for this image; null when the JSON was unavailable. */
+        val verdict: ParseVerdict? = null,
     ) : ParseResult
 
     data class RequiresOverwrite(
         val releases: List<String>,
         val missing: Set<String> = emptySet(),
+    ) : ParseResult
+
+    /** The extractor refused the image, but left a verdict explaining why. */
+    data class Rejected(
+        val verdict: ParseVerdict,
+        val code: Int,
     ) : ParseResult
 
     data object AlreadyPresent : ParseResult

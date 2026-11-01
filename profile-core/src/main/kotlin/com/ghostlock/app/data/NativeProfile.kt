@@ -30,6 +30,8 @@ data class NativeProfileDocument(
     val compactWaiter: UByte?,
     val kernelsnitchCollisions: UInt?,
     val mmStructSz: UInt?,
+    /** offsetof(struct tracepoint, funcs) for the vr.ko sys_exit guard. */
+    val vrTracepointFuncs: UInt? = null,
     val execution: ExecutionTuning,
     val safeMode: UInt,
     /** Route-specific configuration; never part of the shared schema. */
@@ -203,6 +205,7 @@ data class NativeProfileDocument(
         "slide_nfulnl_logger" to kernelOffset.slideNfulnlLogger,
         "slide_loggers_0_1" to kernelOffset.slideLoggers01,
         "slide_boot_id" to kernelOffset.slideBootId,
+        "vr_sys_exit_tp" to kernelOffset.vrSysExitTp,
     )
 
     private fun kernelSection(): Section? {
@@ -212,6 +215,7 @@ data class NativeProfileDocument(
             compactWaiter?.let { add("compact_waiter" to it.toULong()) }
             kernelsnitchCollisions?.let { add("kernelsnitch_collisions" to it.toULong()) }
             mmStructSz?.let { add("mm_struct_sz" to it.toULong()) }
+            vrTracepointFuncs?.let { add("vr_tracepoint_funcs" to it.toULong()) }
         }
         return if (entries.isEmpty()) null else Section("kernel", entries)
     }
@@ -400,12 +404,14 @@ data class NativeProfileDocument(
                     slideNfulnlLogger = vul("offset.slide_nfulnl_logger"),
                     slideLoggers01 = vul("offset.slide_loggers_0_1"),
                     slideBootId = vul("offset.slide_boot_id"),
+                    vrSysExitTp = vulOrNull("offset.vr_sys_exit_tp") ?: 0uL,
                 ),
                 kernelPhysLoad = vulOrNull("kernel_phys_load"),
                 kernelPhysOffset = vulOrNull("kernel_phys_offset"),
                 compactWaiter = vbOrNull("compact_waiter"),
                 kernelsnitchCollisions = vuOrNull("kernelsnitch.collisions"),
                 mmStructSz = vuOrNull("kernelsnitch.mm_struct_sz"),
+                vrTracepointFuncs = vuOrNull("vr_guard.tracepoint_funcs"),
                 execution = ExecutionTuning(
                     recommendedMainCpu = vu("execution.recommended_cpus.main"),
                     recommendedConsumerCpu = vu("execution.recommended_cpus.consumer"),
@@ -678,6 +684,8 @@ data class KernelOffsetTable(
     val slideNfulnlLogger: ULong = 0uL,
     val slideLoggers01: ULong = 0uL,
     val slideBootId: ULong = 0uL,
+    /** __tracepoint_sys_exit (image address); 0 = the profile has no vr.ko guard. */
+    val vrSysExitTp: ULong = 0uL,
 )
 
 data class ExecutionTuning(

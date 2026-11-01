@@ -49,4 +49,81 @@ class ProfileMergerTest {
         assertEquals(3L, selected["main"])
         assertEquals(4L, selected["consumer"])
     }
+
+    @Test
+    fun `profile recommended pair fills a fallback pair`() {
+        val builtin = valueMapOf(
+            "release" to "r",
+            "kernel_major" to 6L,
+            "execution" to valueMapOf(
+                "recommended_cpus" to valueMapOf("main" to 4L, "consumer" to 5L),
+            ),
+        )
+        val resolved = ProfileMerger.resolveMerged(
+            deviceRelease = "r",
+            builtin = builtin,
+            imported = null,
+            overrides = null,
+            tuningExecution = null,
+            pair = CpuPairView(0, 1),
+            routePresets = emptyMap(),
+            pairExplicit = false,
+        )
+        val selected = resolved["execution"].asValueMap()!!["selected_cpus"].asValueMap()!!
+        assertEquals(4L, selected["main"])
+        assertEquals(5L, selected["consumer"])
+    }
+
+    @Test
+    fun `an explicit pick still outranks the recommended pair`() {
+        val builtin = valueMapOf(
+            "release" to "r",
+            "kernel_major" to 6L,
+            "execution" to valueMapOf(
+                "recommended_cpus" to valueMapOf("main" to 4L, "consumer" to 5L),
+            ),
+        )
+        val resolved = ProfileMerger.resolveMerged(
+            deviceRelease = "r",
+            builtin = builtin,
+            imported = null,
+            overrides = null,
+            tuningExecution = null,
+            pair = CpuPairView(2, 3),
+            routePresets = emptyMap(),
+            pairExplicit = true,
+        )
+        val selected = resolved["execution"].asValueMap()!!["selected_cpus"].asValueMap()!!
+        assertEquals(2L, selected["main"])
+        assertEquals(3L, selected["consumer"])
+    }
+
+    @Test
+    fun `an imported selected_cpus wins over the recommended pair`() {
+        val imported = valueMapOf(
+            "execution" to valueMapOf(
+                "selected_cpus" to valueMapOf("main" to 7L, "consumer" to 8L),
+            ),
+        )
+        val builtin = valueMapOf(
+            "release" to "r",
+            "kernel_major" to 6L,
+            "execution" to valueMapOf(
+                "recommended_cpus" to valueMapOf("main" to 4L, "consumer" to 5L),
+            ),
+        )
+        val resolved = ProfileMerger.resolveMerged(
+            deviceRelease = "r",
+            builtin = builtin,
+            imported = imported,
+            overrides = null,
+            tuningExecution = null,
+            pair = CpuPairView(0, 1),
+            routePresets = emptyMap(),
+            pairExplicit = false,
+        )
+        val selected = resolved["execution"].asValueMap()!!["selected_cpus"].asValueMap()!!
+        assertEquals(7L, selected["main"])
+        assertEquals(8L, selected["consumer"])
+    }
 }

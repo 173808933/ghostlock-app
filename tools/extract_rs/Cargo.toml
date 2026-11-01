@@ -23,8 +23,10 @@ yaxpeax-arch = "0.3"
 
 [dependencies.payload-extract]
 package = "payload-extract"
-git = "https://github.com/YuKongA/payload_extract_rs"
-rev = "5534f07298d9f366d6a71daf52cb09141ed96a8a"
+# Vendored from https://codeload.github.com/YuKongA/payload_extract_rs/tar.gz/5534f07298d9f366d6a71daf52cb09141ed96a8a
+# (identical content to the upstream git rev; the build sandbox cannot reach
+# github.com over the git protocol).
+path = "vendor/payload-extract"
 default-features = false
 
 [features]

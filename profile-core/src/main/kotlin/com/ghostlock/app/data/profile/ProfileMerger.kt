@@ -28,6 +28,12 @@ object ProfileMerger {
         tuningExecution: ValueMap?,
         pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
+        /* False when the pair is just the fallback the UI starts on. A profile
+         * that measured a better pair (recommended_cpus, e.g. the iQOO 12
+         * 4/5 cross-cluster pair) may fill it in instead. The default of true
+         * keeps the historical "the pair passed in always wins" behaviour for
+         * every caller that does not track whether the user chose it. */
+        pairExplicit: Boolean = true,
     ): ValueMap {
         val defaults = valueMapOf("release" to deviceRelease).apply {
             if (tuningExecution != null) put("execution", tuningExecution)
@@ -41,16 +47,40 @@ object ProfileMerger {
         )
         resolved["schema_version"] = 1
         resolved["release"] = deviceRelease
-        applySelectedCpus(resolved, pair)
+        applySelectedCpus(resolved, pair, pairExplicit)
         fillRouteExecutionDefaults(resolved, routePresets)
         validateResolved(resolved, deviceRelease)
         return resolved
     }
 
-    private fun applySelectedCpus(resolved: ValueMap, pair: CpuPairView) {
+    private fun applySelectedCpus(
+        resolved: ValueMap,
+        pair: CpuPairView,
+        pairExplicit: Boolean,
+    ) {
+        /* A pair the user actually picked always wins. */
+        if (pairExplicit) {
+            resolved.mutableChild("execution")["selected_cpus"] = valueMapOf(
+                "main" to pair.main.toLong(),
+                "consumer" to pair.consumer.toLong(),
+            )
+            return
+        }
+        val execution = resolved["execution"].asValueMap()
+        /* No explicit pick: a selected_cpus that came from an imported document
+         * or a sparse edit is the next strongest statement; keep it verbatim. */
+        if (execution?.get("selected_cpus").asValueMap() != null) return
+        val recommended = execution?.get("recommended_cpus").asValueMap()
+        val recMain = (recommended?.get("main") as? Number)?.toInt()
+        val recConsumer = (recommended?.get("consumer") as? Number)?.toInt()
+        val effective = if (recMain != null && recConsumer != null) {
+            CpuPairView(recMain, recConsumer)
+        } else {
+            pair
+        }
         resolved.mutableChild("execution")["selected_cpus"] = valueMapOf(
-            "main" to pair.main.toLong(),
-            "consumer" to pair.consumer.toLong(),
+            "main" to effective.main.toLong(),
+            "consumer" to effective.consumer.toLong(),
         )
     }
 

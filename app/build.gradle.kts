@@ -21,8 +21,12 @@ val gitVersionCode = runCatching {
         commandLine("git", "rev-list", "--count", "HEAD")
     }.standardOutput.asText.get().trim().toInt()
 }.getOrElse {
-    logger.warn("git rev-list failed (${it.message}); versionCode falls back to 1")
-    1
+    /* PHY110 tree: not a git checkout, so the upstream count is unavailable.
+     * Pin the baseline instead of "1": this fork is built on upstream 583
+     * (commit 5d675e2) plus the device-verified PHY110 additions, and the
+     * number is what the release page and the in-app status line compare. */
+    logger.warn("git rev-list failed (${it.message}); versionCode pinned to baseline 583")
+    583
 }
 
 val buildInfoSrc = layout.buildDirectory.dir("generated/source/buildInfo")
@@ -175,6 +179,10 @@ tasks.matching { task ->
         (task.name.startsWith("merge") && task.name.endsWith("NativeLibs"))
 }.configureEach {
     dependsOn(rootProject.tasks.named("prepareGhostlockJniLibs"))
+    /* The Rust extractor (libextract.so) backs the on-device porting flow:
+     * point it at a boot.img / OTA payload and it derives the profile there,
+     * with no PC in the loop. It is a PIE executable shipped under a .so name,
+     * which is why the app execs it from nativeLibraryDir. */
     dependsOn(rootProject.tasks.named("prepareGhostlockExtractJniLibs"))
 }
 

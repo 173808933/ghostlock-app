@@ -992,7 +992,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "payload-extract"
 version = "0.1.1"
-source = "git+https://github.com/YuKongA/payload_extract_rs?rev=5534f07298d9f366d6a71daf52cb09141ed96a8a#5534f07298d9f366d6a71daf52cb09141ed96a8a"
 dependencies = [
  "anyhow",
  "bsdiff-android",

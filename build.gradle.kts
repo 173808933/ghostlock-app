@@ -47,20 +47,45 @@ private fun resolveNdkDir(): String {
 private data class NdkTools(val clang: String, val ar: String)
 
 private fun resolveCargoExecutable(): String {
-    val cargoOnPath = System.getenv("PATH")
+    /* Windows installs cargo.exe; File("...", "cargo") never matches there, so
+     * probe both spellings and prefer an absolute path (the bare "cargo"
+     * fallback relies on CreateProcess PATH search, which fails when the JVM
+     * inherits an MSYS-style PATH from Git Bash). */
+    val isWindows = System.getProperty("os.name").lowercase().contains("windows")
+    val names = if (isWindows) listOf("cargo.exe", "cargo") else listOf("cargo")
+
+    /* Real toolchains before anything else: the ~/.cargo/bin shims are rustup
+     * proxies, and a proxy whose metadata is out of sync fails with
+     * "not a valid application for this OS platform" even though the toolchain
+     * itself works. The std manifest check keeps a half-installed toolchain
+     * from being picked. */
+    val toolchains = File(System.getProperty("user.home"), ".rustup/toolchains")
+    val realToolchain = toolchains.listFiles()
+        .orEmpty()
+        .filter { it.isDirectory }
+        .sortedByDescending { it.name }
+        .asSequence()
+        .mapNotNull { dir -> names.asSequence().map { File(dir, "bin/$it") }.firstOrNull { it.isFile } }
+        .firstOrNull { cargo ->
+            val root = cargo.parentFile.parentFile
+            File(root, "lib/rustlib").listFiles().orEmpty()
+                .any { it.name.startsWith("manifest-rust-std-") }
+        }
+    if (realToolchain != null) return realToolchain.absolutePath
+
+    val onPath = System.getenv("PATH")
         .orEmpty()
         .split(File.pathSeparator)
         .asSequence()
-        .map { File(it, "cargo") }
+        .flatMap { dir -> names.asSequence().map { File(dir, it) } }
         .firstOrNull { it.isFile && it.canExecute() }
-    if (cargoOnPath != null) return cargoOnPath.absolutePath
+    if (onPath != null) return onPath.absolutePath
 
-    val cargoInRustupHome = File(System.getProperty("user.home"), ".cargo/bin/cargo")
-    return if (cargoInRustupHome.isFile && cargoInRustupHome.canExecute()) {
-        cargoInRustupHome.absolutePath
-    } else {
-        "cargo"
-    }
+    val rustupHome = File(System.getProperty("user.home"), ".cargo/bin")
+    val inRustupHome = names.asSequence()
+        .map { File(rustupHome, it) }
+        .firstOrNull { it.isFile && it.canExecute() }
+    return inRustupHome?.absolutePath ?: "cargo"
 }
 
 private fun extractNdkTools(): NdkTools {
@@ -130,7 +155,8 @@ tasks.register<Exec>("buildGhostlockExtract") {
     description = "buildGhostlockExtract"
     val tools = extractNdkTools()
     val isOndk = useOndk()
-    val command = mutableListOf(resolveCargoExecutable())
+    val cargoExecutable = resolveCargoExecutable()
+    val command = mutableListOf(cargoExecutable)
     if (isOndk) command += "+ondk"
     command += listOf("build", "--release", "--target", "aarch64-linux-android")
     if (isOndk) {
@@ -139,10 +165,24 @@ tasks.register<Exec>("buildGhostlockExtract") {
     }
     workingDir(rootProject.file("tools/extract_rs"))
     commandLine(command)
+    /* Pin rustc to the same toolchain as cargo. An inherited PATH may resolve
+     * "rustc" to a rustup shim, and a shim whose metadata is off produces host
+     * build scripts that die with os error 193 at run time. */
+    val isWindowsHost = System.getProperty("os.name").lowercase().contains("windows")
+    environment(
+        "RUSTC",
+        File(cargoExecutable).resolveSibling(if (isWindowsHost) "rustc.exe" else "rustc").absolutePath,
+    )
     environment("CC_aarch64_linux_android", tools.clang)
     environment("AR_aarch64_linux_android", tools.ar)
     environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", tools.clang)
-    environment("RUSTFLAGS", "-C force-unwind-tables=no -C link-arg=-Wl,--icf=all")
+    /* Target-scoped, never the global RUSTFLAGS: the global form also reaches
+     * the host build scripts, and "-C link-arg=-Wl,--icf=all" makes the MSVC
+     * host linker emit a PE cargo then rejects with os error 193. */
+    environment(
+        "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS",
+        "-C force-unwind-tables=no -C link-arg=-Wl,--icf=all",
+    )
     if (isOndk) environment("RUSTC_BOOTSTRAP", "1")
     inputs.files(
         fileTree("tools/extract_rs/src") { include("**/*.rs") },

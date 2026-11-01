@@ -63,6 +63,11 @@ namespace ghostlock::support {
     uintptr_t prepare_kernel_page(const ghostlock::memory::WriteRequest *request);
 
     uintptr_t prepare_good_kernel_page(const ghostlock::memory::WriteRequest &request);
+
+    /* W2D: yield the PI/futex subsystem back to a quiet state between the W2
+     * prebuild collision scan and the main write's second scan. See the call
+     * site in the 43499 backend for why two scans run back to back. */
+    void settle_w2_prebuild(void);
 } // namespace ghostlock::support
 
 #endif

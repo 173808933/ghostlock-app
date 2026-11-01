@@ -107,6 +107,9 @@ namespace ghostlock::binary_profile {
             PLAIN("slide_nfulnl_logger", offsets.slide_nfulnl_logger),
             PLAIN("slide_loggers_0_1", offsets.slide_loggers_0_1),
             PLAIN("slide_boot_id", offsets.slide_boot_id),
+            /* 0 means "this profile has no vr.ko guard", which is also what a
+             * profile written before the guard existed carries. */
+            PLAIN("vr_sys_exit_tp", offsets.vr_sys_exit_tp),
         };
 
         constexpr Field kKernel[] = {
@@ -115,6 +118,7 @@ namespace ghostlock::binary_profile {
             OPT("compact_waiter", misc.compact_waiter),
             OPT("kernelsnitch_collisions", misc.kernelsnitch_collisions),
             OPT("mm_struct_sz", misc.mm_struct_sz),
+            OPT("vr_tracepoint_funcs", misc.vr_tracepoint_funcs),
         };
 
         constexpr Field kExecCpus[] = {
@@ -186,6 +190,11 @@ namespace ghostlock::binary_profile {
             OPT("buffer_size", geometry.mcast_buffer_size),
             OPT("task_offset", geometry.mcast_task_offset),
             OPT("lock_offset", geometry.mcast_lock_offset),
+            /* Optional: a profile written before these knobs existed keeps
+             * the historical single-shot multicast behaviour. */
+            PLAIN("attempts", execution.mcast_attempts),
+            PLAIN("arm_sequence", execution.mcast_arm_sequence),
+            PLAIN("arm_hold", execution.mcast_arm_hold),
         };
 
         struct Section {

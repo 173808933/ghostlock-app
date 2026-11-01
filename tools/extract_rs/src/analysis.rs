@@ -9,7 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::btf::Btf;
-use crate::derive::{PSELECT_ROUTE_NFDS, PselectLayout, RelSymbols, derive_pselect_layout};
+use crate::derive::{
+    PSELECT_ROUTE_NFDS, PselectLayout, RelSymbols, SigretGeometry, derive_pselect_layout,
+    derive_sigret_geometry,
+};
 use crate::error::ExtractError;
 use crate::kallsyms;
 use crate::symbols::{kernel_layout_verified, kernel_struct_macro};
@@ -45,6 +48,15 @@ pub struct PathCandidate {
     pub available: bool,
 }
 
+/// The rt_sigreturn punch as one evaluated candidate: geometry plus the
+/// feasibility verdict the app shows to the user.
+#[derive(Debug, Clone)]
+pub struct SigretReport {
+    pub geometry: SigretGeometry,
+    pub feasible: bool,
+    pub reason: String,
+}
+
 pub struct Analysis {
     pub release: Option<String>,
     pub kernel_major: Option<u32>,
@@ -58,6 +70,11 @@ pub struct Analysis {
     pub mm_struct_size: Option<u32>,
     pub primitive: Result<u64, String>,
     pub pselect: PselectOutcome,
+    /// rt_sigreturn fpsimd punch geometry (our route; official builds do not
+    /// probe it). `None` when the derivation failed — the reason is in
+    /// `sigret_error`.
+    pub sigret: Option<SigretReport>,
+    pub sigret_error: Option<String>,
     pub paths: Vec<PathCandidate>,
     pub suggestion: Option<&'static str>,
     pub suggestion_confidence: Confidence,
@@ -237,6 +254,30 @@ pub fn build(input: Input<'_>) -> Analysis {
         },
     };
 
+    let (sigret, sigret_error) = if input.allow_disasm {
+        match derive_sigret_geometry(input.kernel, input.rel_symbols, input.sorted_offsets) {
+            Ok(geometry) => {
+                let feasible = geometry.feasible();
+                let reason = if feasible {
+                    String::new()
+                } else {
+                    geometry.infeasible_reason()
+                };
+                (
+                    Some(SigretReport {
+                        geometry,
+                        feasible,
+                        reason,
+                    }),
+                    None,
+                )
+            }
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, Some("--no-disasm".to_string()))
+    };
+
     let paths = probe_paths(
         input.symbols,
         input.kernel,
@@ -260,6 +301,8 @@ pub fn build(input: Input<'_>) -> Analysis {
         mm_struct_size,
         primitive: input.primitive.map_err(|err| err.to_string()),
         pselect,
+        sigret,
+        sigret_error,
         paths,
         suggestion,
         suggestion_confidence,
@@ -346,6 +389,23 @@ fn render_pselect(pselect: &PselectOutcome) -> String {
     }
 }
 
+fn render_sigret(analysis: &Analysis) -> String {
+    match &analysis.sigret {
+        Some(report) if report.feasible => format!(
+            "feasible waiter_off=0x{:x} (D=0x{:x} depth=0x{:x} buffer=0x{:x})",
+            report.geometry.waiter_off,
+            report.geometry.d,
+            report.geometry.waiter_depth,
+            report.geometry.copy_size
+        ),
+        Some(report) => format!("infeasible: {}", report.reason),
+        None => format!(
+            "not derived ({})",
+            analysis.sigret_error.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
 pub fn render(analysis: &Analysis) -> String {
     let mut lines = Vec::new();
     let field = |name: &str, value: String| format!("{name:<23} {value}");
@@ -403,6 +463,7 @@ pub fn render(analysis: &Analysis) -> String {
         },
     ));
     lines.push(field("pselect chain", render_pselect(&analysis.pselect)));
+    lines.push(field("sigret punch", render_sigret(analysis)));
     for path in &analysis.paths {
         let state = if path.available {
             "available"
@@ -507,4 +568,112 @@ mod tests {
         assert!(!route_depends_on_pselect_layout("tcp_zerocopy"));
         assert!(!route_depends_on_pselect_layout("multicast_waiter"));
     }
+}
+
+/// Machine-readable form of the same report: this is what the app consumes to
+/// show a verdict and to decide which punch the profile needs.
+pub fn render_json(analysis: &Analysis) -> String {
+    use serde_json::json;
+
+    let mut routes: Vec<serde_json::Value> = Vec::new();
+    for path in &analysis.paths {
+        let probes: Vec<serde_json::Value> = path
+            .probes
+            .iter()
+            .map(|(name, address)| json!({"symbol": name, "address": address}))
+            .collect();
+        routes.push(json!({
+            "route": path.route,
+            "available": path.available,
+            "derived": false,
+            "probes": probes,
+        }));
+    }
+    if let Some(report) = &analysis.sigret {
+        let geometry = &report.geometry;
+        routes.push(json!({
+            "route": "sigret",
+            "available": true,
+            "derived": true,
+            "feasible": report.feasible,
+            "waiter_off": geometry.waiter_off,
+            "d": geometry.d,
+            "depth": geometry.waiter_depth,
+            "buffer": geometry.copy_size,
+            "container_frame": geometry.container_frame,
+            "copy_local": geometry.copy_local,
+            "futex_frames": geometry.futex_frames,
+            "waiter_local": geometry.waiter_local,
+            "reason": report.reason,
+        }));
+    }
+
+    let sigret_feasible = analysis.sigret.as_ref().is_some_and(|report| report.feasible);
+    let patched = analysis.primitive.is_err();
+    let too_old = match (analysis.kernel_major, analysis.kernel_minor) {
+        (Some(major), _) if major < 5 => true,
+        (Some(5), Some(minor)) if minor < 10 => true,
+        _ => false,
+    };
+    let (level, mut reasons) = if patched {
+        (
+            "unusable",
+            vec!["remove_waiter 已修补，CVE-2026-43499 不存在".to_string()],
+        )
+    } else if too_old {
+        (
+            "unusable",
+            vec!["内核低于 5.10：KernelSU late-load 没有对应 KMI".to_string()],
+        )
+    } else if sigret_feasible {
+        (
+            "usable",
+            vec!["rt_sigreturn 写入窗口覆盖 futex waiter".to_string()],
+        )
+    } else {
+        (
+            "risky",
+            vec!["sigret 不可行；需按官方路线（tcp / multicast / pselect）实测".to_string()],
+        )
+    };
+    if analysis.phys.is_none() && level != "unusable" {
+        reasons.push("缺少 kernel_phys_load：未能从镜像证实物理加载地址".to_string());
+    }
+    let punch = if sigret_feasible { "sigret" } else { "setsockopt" };
+
+    json!({
+        "tool": "ghostlock-extract",
+        "release": &analysis.release,
+        "kernel_major": analysis.kernel_major,
+        "kernel_minor": analysis.kernel_minor,
+        "family": &analysis.family,
+        "family_verified": analysis.family_verified,
+        "phys": analysis.phys,
+        "phys_source": analysis.phys_source,
+        "mm_struct_size": analysis.mm_struct_size,
+        "waiter": {
+            "size": analysis.waiter_size,
+            "fields": &analysis.waiter_fields,
+        },
+        "primitive": {
+            "patched": patched,
+            "detail": match &analysis.primitive {
+                Ok(address) => format!("remove_waiter@0x{address:x} unpatched"),
+                Err(message) => message.clone(),
+            },
+        },
+        "pselect": render_pselect(&analysis.pselect),
+        "punch": punch,
+        "routes": routes,
+        "suggestion": {
+            "route": &analysis.suggestion,
+            "confidence": analysis.suggestion_confidence.label(),
+            "reasons": &analysis.suggestion_reasons,
+        },
+        "verdict": {
+            "level": level,
+            "reasons": reasons,
+        },
+    })
+    .to_string()
 }

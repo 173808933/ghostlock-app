@@ -3,7 +3,11 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Root-manager discovery: enumerate every installed package and
+         keep the ones whose nativeLibraryDir carries libksud.so. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="me.weishu.kernelsu.pr" />
@@ -30,6 +34,12 @@
             android:name=".shizuku.GhostlockUserService"
             android:exported="false"
             tools:ignore="Instantiatable" />
+        <!-- PHY110: keeps the process alive while the exploit race runs. -->
+        <service
+            android:name=".KeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity
             android:name=".ui.MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|mnc|colorMode|density|fontScale|fontWeightAdjustment|keyboard|layoutDirection|locale|mcc|navigation|smallestScreenSize|touchscreen|uiMode"

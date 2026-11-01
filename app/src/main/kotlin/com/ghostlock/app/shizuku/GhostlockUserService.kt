@@ -3,8 +3,8 @@ package com.ghostlock.app.shizuku
 import android.content.Context
 import android.os.Process
 import androidx.annotation.Keep
-import com.ghostlock.app.data.ManagerScanner
 import com.ghostlock.app.data.NativeProfileDocument
+import com.ghostlock.app.data.Phy110Profiles
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicBoolean
@@ -26,18 +26,6 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         forceAttack: Boolean,
         profileBlob: ByteArray,
         debugDir: String?,
-        callback: IGhostlockCallback,
-        statusCallback: IGhostlockStatusCallback,
-    ) = runExploitAsManager(primaryCpu, consumerCpu, safeMode, forceAttack, profileBlob, debugDir, null, callback, statusCallback)
-
-    override fun runExploitAsManager(
-        primaryCpu: Int,
-        consumerCpu: Int,
-        safeMode: Boolean,
-        forceAttack: Boolean,
-        profileBlob: ByteArray,
-        debugDir: String?,
-        managerPackage: String?,
         callback: IGhostlockCallback,
         statusCallback: IGhostlockStatusCallback,
     ) {
@@ -72,18 +60,6 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 }
                 callback.onLog("<s> Shizuku ready: uid=${Process.myUid()} Seccomp=0")
                 callback.onLog("<s> kernel: $release")
-                // Same resolution as the direct path: chosen manager first,
-                // then the built-ins. Native gets the path via GHOSTLOCK_KSUD.
-                val pm = context.packageManager
-                val ksudPath = ManagerScanner.resolvePackages(managerPackage)
-                    .asSequence()
-                    .map { pkg ->
-                        runCatching {
-                            File(pm.getApplicationInfo(pkg, 0).nativeLibraryDir, "libksud.so")
-                        }.getOrNull()?.takeIf { it.isFile }
-                    }
-                    .firstOrNull { it != null }
-                ksudPath?.let { callback.onLog("<s> ksud resolved: ${it.absolutePath}") }
                 val nativeLog = File(workDir, ".ghostlock_native.log")
                 // U01-S14: per-run KernelSU log so a previous run's markers can
                 // never satisfy the handoff probe; the native process receives
@@ -117,8 +93,16 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         environment()["TMPDIR"] = workDir.absolutePath
                         environment()["HOME"] = workDir.absolutePath
                         environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
-                        if (ksudPath != null) {
-                            environment()["GHOSTLOCK_KSUD"] = ksudPath.absolutePath
+                        /* PHY110: the prebuilt blob is calibrated for the 64-bit
+                         * rt_sigreturn fpsimd punch; the default
+                         * MCAST_BLOCK_SOURCE punch is infeasible on this kernel. */
+                        val prefs = context.getSharedPreferences(
+                            "ghostlock_prefs", android.content.Context.MODE_PRIVATE,
+                        )
+                        val importedSigret = prefs.getString("punch_release", null) == release &&
+                            prefs.getString("punch_mode", null) == "sigret"
+                        if (Phy110Profiles.isPrebuilt(context, release, profileBlob) || importedSigret) {
+                            environment()["GL_PUNCH"] = "sigret"
                         }
                     }
                     .start()

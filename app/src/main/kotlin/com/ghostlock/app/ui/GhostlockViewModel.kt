@@ -10,6 +10,7 @@ import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LogTone
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.ParseVerdict
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.ShizukuStatus
@@ -22,6 +23,7 @@ import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
+import com.ghostlock.app.data.Phy110Guard
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -842,28 +844,6 @@ class GhostlockViewModel(
         viewModelScope.launch { refreshSnapshot() }
     }
 
-    fun onOpenManagerPicker() {
-        mutableState.update { it.copy(managerPickerVisible = true) }
-        viewModelScope.launch {
-            val candidates = repository.installedManagers()
-            mutableState.update {
-                it.copy(
-                    managerCandidates = candidates,
-                    selectedManagerPackage = repository.selectedManagerPackage(),
-                )
-            }
-        }
-    }
-
-    fun onCloseManagerPicker() {
-        mutableState.update { it.copy(managerPickerVisible = false) }
-    }
-
-    fun onManagerSelected(pkg: String?) {
-        repository.setSelectedManagerPackage(pkg)
-        mutableState.update { it.copy(selectedManagerPackage = pkg, managerPickerVisible = false) }
-    }
-
     fun onRun() = runExploit()
 
     /** Explains why the run button is greyed out. */
@@ -898,6 +878,16 @@ class GhostlockViewModel(
         if (!snapshot.kernelSupported) {
             if (beginOperation()) {
                 appendLog("result: exploit chain unsupported by this kernel")
+                endOperation()
+            }
+            return
+        }
+        /* PHY110 run discipline: wait for the startup storm to pass, and never
+         * run twice in the same boot (the second run panics reliably). */
+        val gate = Phy110Guard.check()
+        if (!gate.ok) {
+            if (beginOperation()) {
+                appendLog("gate: ${gate.message}")
                 endOperation()
             }
             return
@@ -1089,7 +1079,6 @@ class GhostlockViewModel(
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,
                 customCpuPair = loaded?.let(::customCpuPairOf),
-                selectedManagerPackage = repository.selectedManagerPackage(),
             )
         }
     }
@@ -1310,10 +1299,48 @@ class GhostlockViewModel(
                 dialogType = DialogType.NOTICE,
                 dialogTitleRes = titleRes,
                 dialogMessageRes = messageRes,
+                dialogMessageText = null,
                 dialogDocUrl = docUrl,
                 dialogConfirmLabelRes = R.string.dialog_dismiss,
             )
         }
+    }
+
+    /** Notice whose body is composed at run time (e.g. the parse verdict). */
+    private fun showNoticeText(titleRes: Int, message: String) {
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.NOTICE,
+                dialogTitleRes = titleRes,
+                dialogMessageRes = 0,
+                dialogMessageText = message,
+                dialogDocUrl = null,
+                dialogConfirmLabelRes = R.string.dialog_dismiss,
+            )
+        }
+    }
+
+    /** "✅ 可用 · sigret / waiter_off=0xe8 …" — the same numbers the CLI prints. */
+    private fun verdictText(verdict: ParseVerdict, missing: Set<String>): String {
+        fun hex(value: Long?) = value?.let { "0x" + it.toString(16) }
+        val head = when (verdict.level) {
+            "usable" -> "✅ 可用"
+            "risky" -> "⚠️ 待确认"
+            else -> "❌ 不可用"
+        }
+        val route = verdict.route?.let { " · $it" }.orEmpty()
+        val lines = mutableListOf("$head$route")
+        val geometry = listOfNotNull(
+            verdict.waiterOff?.let { "waiter_off=${hex(it)}" },
+            verdict.d?.let { "D=${hex(it)}" },
+            verdict.depth?.let { "depth=${hex(it)}" },
+            verdict.buffer?.let { "buffer=${hex(it)}" },
+        )
+        if (geometry.isNotEmpty()) lines += geometry.joinToString("  ")
+        verdict.reasons.filter { it.isNotBlank() }.forEach { lines += "· $it" }
+        if (missing.isNotEmpty()) lines += "· 缺少 ${missing.joinToString()}，可用 xbl_config 补"
+        return lines.joinToString("\n")
     }
 
     private fun isMediaTek(): Boolean {
@@ -1357,7 +1384,18 @@ class GhostlockViewModel(
                         appendLog("auto-loading parsed profile: ${result.documentName}")
                         selectUserProfile(result.documentName)
                     }
-                    if (result.missing.isNotEmpty()) {
+                    val verdict = result.verdict
+                    if (verdict != null) {
+                        appendLog(
+                            "verdict: ${verdict.level} route=${verdict.route} punch=${verdict.punch} " +
+                                    "waiter_off=${verdict.waiterOff}",
+                        )
+                        showNoticeText(
+                            R.string.parse_result_title,
+                            verdictText(verdict, result.missing),
+                        )
+                    }
+                    if (result.missing.isNotEmpty() && verdict == null) {
                         appendLog(
                             "warning: missing ${result.missing.joinToString()}; " +
                                     "run the MediaTek extractor or attach xbl_config.img / uefi.img",
@@ -1372,9 +1410,17 @@ class GhostlockViewModel(
                             },
                             docUrl = if (mediaTek) mediatekDocUrl() else null,
                         )
-                    } else if (result.documentName == null) {
+                    } else if (verdict == null && result.documentName == null) {
                         showNotice(R.string.parse_result_title, R.string.parse_success)
                     }
+                }
+
+                is ParseResult.Rejected -> {
+                    appendLog("verdict: ${result.verdict.level} (${result.verdict.reasons.joinToString()})")
+                    showNoticeText(
+                        R.string.parse_result_title,
+                        verdictText(result.verdict, emptySet()),
+                    )
                 }
 
                 ParseResult.AlreadyPresent -> {

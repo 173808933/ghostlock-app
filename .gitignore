@@ -19,3 +19,7 @@ target/
 /.codex/
 /src/.codex/config.toml
 /ghostlock *
+
+# pc-tools bytecode (the tree-level __pycache__ rule already covers most cases)
+pc-tools/**/__pycache__/
+pc-tools/**/*.pyc

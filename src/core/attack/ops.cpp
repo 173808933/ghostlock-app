@@ -239,24 +239,19 @@ namespace ghostlock::attack {
             "HOME_DIR='%s'\n"
             "LOG='%s'\n"
             "SAFE_MODE=%d\n"
-            "KSUD='%s'\n"
+            "KSUD=\"$HOME_DIR/ksud\"\n"
             "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
             "chmod 644 \"$LOG\" 2>/dev/null\n"
             "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
+            /* Discovery, not a package list: any installed app that ships
+             * libksud.so is a valid manager, so forks and renamed builds work
+             * without a rebuild. Kotlin already copies its pick to $HOME_DIR;
+             * this is the fallback when that copy did not happen. */
             "if [ ! -x \"$KSUD\" ]; then\n"
-            "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu.pr*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+            "  KSUD=$(find /data/app -name libksud.so -path '*/lib/arm64/*' 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ ! -x \"$KSUD\" ]; then\n"
-            "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
-            "fi\n"
-            "if [ ! -x \"$KSUD\" ]; then\n"
-            "  KSUD=$(find /data/app -path '*/com.resukisu.resukisu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
-            "fi\n"
-            "if [ ! -x \"$KSUD\" ]; then\n"
-            "  KSUD=$(find /data/app -path '*/org.bakasu.bakasu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
-            "fi\n"
-            "if [ ! -x \"$KSUD\" ]; then\n"
-            "  KSUD=$(find /data/app -path '*/com.kowx712.supermanager*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+            "  KSUD=$(find /data/app -name libksud.so 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ -z \"$KSUD\" ]; then KSUD=/data/local/tmp/ksud; fi\n"
             "if [ ! -x \"$KSUD\" ]; then KSUD=/data/adb/ksu/bin/ksud; fi\n"
@@ -415,7 +410,6 @@ namespace ghostlock::attack {
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),
             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
-            (config::runtime_config_snapshot().ksud_path.c_str()),
             (config::runtime_config_snapshot().debug_dir.c_str()));
         if (n < 0 || n >= static_cast<int32_t>(script.size())) {
             pr_warning("root script too long\n");

