@@ -46,6 +46,29 @@ private fun resolveNdkDir(): String {
 
 private data class NdkTools(val clang: String, val ar: String)
 
+/* The rustup proxy, not a concrete toolchain binary: `cargo +ondk build` is a
+ * proxy-side argument and a real cargo from ~/.rustup/toolchains/<triple>/bin
+ * rejects it ("no such command: +ondk"). ONDK builds must go through this path. */
+private fun resolveRustupCargo(): String {
+    val names = if (System.getProperty("os.name").lowercase().contains("windows")) {
+        listOf("cargo.exe", "cargo")
+    } else {
+        listOf("cargo")
+    }
+    val onPath = System.getenv("PATH")
+        .orEmpty()
+        .split(File.pathSeparator)
+        .asSequence()
+        .flatMap { dir -> names.asSequence().map { File(dir, it) } }
+        .firstOrNull { it.isFile && it.canExecute() }
+    if (onPath != null) return onPath.absolutePath
+
+    val inRustupHome = names.asSequence()
+        .map { File(File(System.getProperty("user.home"), ".cargo/bin"), it) }
+        .firstOrNull { it.isFile && it.canExecute() }
+    return inRustupHome?.absolutePath ?: "cargo"
+}
+
 private fun resolveCargoExecutable(): String {
     /* Windows installs cargo.exe; File("...", "cargo") never matches there, so
      * probe both spellings and prefer an absolute path (the bare "cargo"
@@ -155,7 +178,10 @@ tasks.register<Exec>("buildGhostlockExtract") {
     description = "buildGhostlockExtract"
     val tools = extractNdkTools()
     val isOndk = useOndk()
-    val cargoExecutable = resolveCargoExecutable()
+    /* An ONDK build needs the rustup proxy so that +ondk resolves the linked
+     * toolchain and -Z build-std is permitted; a local build wants the real
+     * toolchain binary, because the shims on this machine are broken. */
+    val cargoExecutable = if (isOndk) resolveRustupCargo() else resolveCargoExecutable()
     val command = mutableListOf(cargoExecutable)
     if (isOndk) command += "+ondk"
     command += listOf("build", "--release", "--target", "aarch64-linux-android")
@@ -167,12 +193,16 @@ tasks.register<Exec>("buildGhostlockExtract") {
     commandLine(command)
     /* Pin rustc to the same toolchain as cargo. An inherited PATH may resolve
      * "rustc" to a rustup shim, and a shim whose metadata is off produces host
-     * build scripts that die with os error 193 at run time. */
+     * build scripts that die with os error 193 at run time. Skipped for ONDK:
+     * there the rustup proxy owns toolchain selection, and pinning a concrete
+     * rustc would fight `+ondk`. */
     val isWindowsHost = System.getProperty("os.name").lowercase().contains("windows")
-    environment(
-        "RUSTC",
-        File(cargoExecutable).resolveSibling(if (isWindowsHost) "rustc.exe" else "rustc").absolutePath,
-    )
+    if (!isOndk) {
+        environment(
+            "RUSTC",
+            File(cargoExecutable).resolveSibling(if (isWindowsHost) "rustc.exe" else "rustc").absolutePath,
+        )
+    }
     environment("CC_aarch64_linux_android", tools.clang)
     environment("AR_aarch64_linux_android", tools.ar)
     environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", tools.clang)
