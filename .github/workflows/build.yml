@@ -76,8 +76,11 @@ jobs:
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
       - name: Decode Android signing key
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && secrets.SIGNING_KEY != '' }}
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && env.HAS_SIGNING_KEY == '1' }}
+        env:
+          HAS_SIGNING_KEY: ${{ secrets.SIGNING_KEY != '' && '1' || '0' }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: echo "$SIGNING_KEY" | base64 -d > keystore.jks
 
       - name: Build Ghostlock binary
         run: |
@@ -341,24 +344,3 @@ jobs:
           files: release-files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  post_telegram:
-    needs: [build-apk, build-extractor-macos, build-extractor-windows]
-    runs-on: ubuntu-latest
-    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && github.ref_type != 'tag' && secrets.BOT_TOKEN != '' }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          skip-decompress: true
-
-      - name: Post to Telegram
-        env:
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          BOT_API_LINK: ${{ secrets.BOT_API_LINK }}
-        run: bash .github/scripts/post_telegram.sh
