@@ -26,6 +26,12 @@ using namespace ghostlock;
 
 
 int main(int argc, char **argv) {
+    /* First line out of the process, synced before anything else runs. When a
+     * panic leaves the log file empty, this line is what separates "native never
+     * started" (dynamic linking, seccomp, SELinux) from "started and died during
+     * profile decode / address resolution, before the first stage mark". */
+    pr_info("native start argc=%d\n", argc);
+    ghostlock::support::log_sync();
     try {
         profile::kernel_offsets decoded = {};
         std::array<char, 256> release_buf{};
