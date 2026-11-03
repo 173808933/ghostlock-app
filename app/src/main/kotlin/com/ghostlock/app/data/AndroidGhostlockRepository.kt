@@ -516,7 +516,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                      * file, which both processes read from the same inode. */
                     runCatching {
                         File(appContext.filesDir, PunchFileName)
-                            .writeText(punchMode(release).orEmpty())
+                            .writeText(config.punch ?: punchMode(release).orEmpty())
                     }
                     shizukuRunner.run(
                         pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,

@@ -105,14 +105,20 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                          * before starting this service; SharedPreferences is
                          * per-process and under-synchronised across the app/
                          * UserService boundary, so it can only ever be a hint. */
-                        val fileSigret = runCatching {
+                        val carriedPunch = runCatching {
                             File(context.filesDir, "punch.txt").readText().trim()
-                        }.getOrDefault("") == "sigret"
-                        if (Phy110Profiles.isPrebuilt(context, release, profileBlob) ||
-                            fileSigret || importedSigret
-                        ) {
+                        }.getOrDefault("")
+                        val prebuiltBlob = Phy110Profiles.isPrebuilt(context, release, profileBlob)
+                        val useSigret = prebuiltBlob || carriedPunch == "sigret" || importedSigret
+                        if (useSigret) {
                             environment()["GL_PUNCH"] = "sigret"
                         }
+                        callback.onLog(
+                            "<s> punch: carrier='" + carriedPunch +
+                                "' prebuilt=" + prebuiltBlob +
+                                " prefs=" + importedSigret +
+                                " -> " + (if (useSigret) "sigret" else "default"),
+                        )
                     }
                     .start()
                     .let { process ->
