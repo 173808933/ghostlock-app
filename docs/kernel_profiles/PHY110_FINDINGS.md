@@ -98,6 +98,22 @@ val useSigret = punch == "sigret" || prebuiltBlob ||
 改 AIDL 后必须同步 bump `UserServiceArgs.version(...)`，否则 Shizuku 会复用
 按旧接口解压出来的 dex，服务端仍是旧代码。
 
+**验证（2026-11-04，6.1.141-o-gffc54a6d2287，Shizuku 模式）**
+
+```
+<s> punch: binder='sigret' carrier='' prebuilt=false prefs=false -> sigret
+[*] multicast route enter ... punch=sigret
+[+] SELinux permissive                 (W1 attempt 2)
+[T+14626ms] Write 1 complete           (W1b attempt 1)
+[*] child uid = 0                      (W2 attempt 1)
+[+] no app seccomp filter (adb/shell flow); skipping W3
+[T+23552ms] exploit complete
+[+] KernelSU ready
+```
+
+整条链路 23.5 秒，W1 用掉两次抽签、W1b 与 W2 各一次。`carrier=''` 是预期值——
+文件通道在这个方向上永远读不到，`binder=` 才是实际生效的那个。
+
 app 侧取值顺序：`config.punch` → `renderResolvedForDebug()` 的 `punch` 行 → prefs。
 `punchOf()` 里曾用 `as? String`，遇到非字符串类型静默返回 null，于是载体被写成
 字面量 `"null"`——`punchMode()` 现在也过掉这个值。
