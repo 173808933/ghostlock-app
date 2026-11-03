@@ -59,6 +59,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * entry from another kernel can never be applied. */
         const val PrefPunchRelease = "punch_release"
         const val PrefPunchMode = "punch_mode"
+        /* Cross-process carrier for the punch selection; see the write site. */
+        const val PunchFileName = "punch.txt"
         const val AnalysisFileName = "analysis.json"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
@@ -508,6 +510,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     // same boot panics reliably.
                     Phy110Guard.markRun()
                     resetRunState()
+                    /* SharedPreferences is per-process: the UserService runs under
+                     * its own pid, so a value written here after it started is
+                     * invisible to it. The punch selection therefore travels as a
+                     * file, which both processes read from the same inode. */
+                    runCatching {
+                        File(appContext.filesDir, PunchFileName)
+                            .writeText(punchMode(release).orEmpty())
+                    }
                     shizukuRunner.run(
                         pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,
                     ) { step, status ->

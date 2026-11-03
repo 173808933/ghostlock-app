@@ -101,7 +101,16 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         )
                         val importedSigret = prefs.getString("punch_release", null) == release &&
                             prefs.getString("punch_mode", null) == "sigret"
-                        if (Phy110Profiles.isPrebuilt(context, release, profileBlob) || importedSigret) {
+                        /* The app writes the effective punch next to its files
+                         * before starting this service; SharedPreferences is
+                         * per-process and under-synchronised across the app/
+                         * UserService boundary, so it can only ever be a hint. */
+                        val fileSigret = runCatching {
+                            File(context.filesDir, "punch.txt").readText().trim()
+                        }.getOrDefault("") == "sigret"
+                        if (Phy110Profiles.isPrebuilt(context, release, profileBlob) ||
+                            fileSigret || importedSigret
+                        ) {
                             environment()["GL_PUNCH"] = "sigret"
                         }
                     }
