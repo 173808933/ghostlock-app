@@ -544,31 +544,33 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     // same boot panics reliably.
                     BootGuard.markRun()
                     resetRunState()
-                    /* SharedPreferences is per-process: the UserService runs under
-                     * its own pid, so a value written here after it started is
-                     * invisible to it. The punch selection therefore travels as a
-                     * file, which both processes read from the same inode. */
-                    runCatching {
-                        /* config.punch is the parsed value, but the resolved
-                         * document is the one thing already proven to carry it
-                         * (it is what the debug dump writes). Fall back to
-                         * scanning its text before giving up on the preference
-                         * store, which only ever holds what an import recorded. */
+                    /* The punch selection goes across as a binder argument.
+                     * The service runs under uid 2000 and cannot read this
+                     * process's private files, so the punch.txt carrier always
+                     * came back empty there; SharedPreferences has the same
+                     * problem for a different reason (per-process cache). Keep
+                     * writing the file only for tooling that inspects it. */
+                    val effectivePunch = runCatching {
                         val fromRender = runCatching {
                             profileController.renderResolvedForDebug(release, pair)?.let { text ->
                                 Regex("(?m)^\\s*punch\\s*=\\s*\"([^\"]+)\"")
                                     .find(text)?.groupValues?.get(1)
                             }
                         }.getOrNull()
-                        val carried = config.punch ?: fromRender ?: punchMode(release).orEmpty()
-                        File(appContext.filesDir, PunchFileName).writeText(carried)
+                        val resolved = sequenceOf(config.punch, fromRender, punchMode(release))
+                            .firstOrNull { !it.isNullOrBlank() && it != "null" }
                         archivedLog(
-                            "<s> punch carrier='" + carried + "' config=" + config.punch +
+                            "<s> punch resolved='" + resolved + "' config=" + config.punch +
                                 " render=" + fromRender,
                         )
-                    }
+                        runCatching {
+                            File(appContext.filesDir, PunchFileName).writeText(resolved.orEmpty())
+                        }
+                        resolved
+                    }.getOrNull()
                     shizukuRunner.run(
-                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,
+                        pair, safeModeEnabled, forceAttackTest, profileBlob, effectivePunch,
+                        debugDir, archivedLog,
                     ) { step, status ->
                         if (status == "disabled") clearRunState() else applyRunStatus(step, status)
                     }
