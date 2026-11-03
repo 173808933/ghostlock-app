@@ -516,7 +516,13 @@ namespace ghostlock::session::backend {
                     w1_attempts = 1;
                     if (const char *punch = getenv("GL_PUNCH");
                         punch && strcmp(punch, "sigret") == 0) {
-                        w1_attempts = 3;
+                        /* Profile wins: a sigret W1 write is a heap draw, and
+                         * the profile field exists precisely to say how many
+                         * draws this build needs. Three was an arbitrary floor
+                         * that silently overrode a profile asking for more, and
+                         * a run that missed three times reported a clean
+                         * "Write 1 failed" while the geometry was fine. */
+                        if (w1_attempts < 3) w1_attempts = 3;
                     }
                 }
                 support::run_state::enter("w1a");
