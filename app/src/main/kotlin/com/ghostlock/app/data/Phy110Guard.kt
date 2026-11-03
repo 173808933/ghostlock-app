@@ -47,8 +47,12 @@ object Phy110Guard {
     private const val KEY_LAST_RUN_WALL = "last_run_wall_clock"
     private const val KEY_LAST_RUN_TS = "last_run_ts"
 
-    /** Minimum time since boot (seconds) before a run is allowed. */
-    const val SETTLE_SECONDS: Int = 120
+    /** Minimum time since boot (seconds) before a run is allowed.
+     * 180s: the first minutes after boot are dominated by app cold starts and
+     * dex2oat, and the heap spray needs the slab to have settled. Two minutes
+     * still let a run start while the launcher was thawing (loadavg 6-8),
+     * which is exactly the state that turns W1 into a missed draw. */
+    const val SETTLE_SECONDS: Int = 180
 
     /** Slack for the monotonic/wall cross-check (NTP jitter, scheduling). */
     private const val SAME_BOOT_TOLERANCE_MS = 5_000L
