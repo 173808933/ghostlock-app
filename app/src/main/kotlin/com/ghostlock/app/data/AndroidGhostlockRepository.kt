@@ -53,17 +53,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugExportLocation = "debug_export_location"
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
-        /* Punch the native binary must use for an on-device derived profile.
-         * Written by the importer when the extractor's analysis says the
-         * rt_sigreturn route is the feasible one; keyed by release so a stale
-         * entry from another kernel can never be applied. */
-        const val PrefPunchRelease = "punch_release"
-        const val PrefPunchMode = "punch_mode"
-        /* Cross-process carrier for the punch selection; see the write site. */
-        const val PunchFileName = "punch.txt"
-        /* Diagnostic build only: resolve the punch and stop before native runs.
-         * Flip back to false for any build that is meant to attack. */
-        private const val DIAGNOSE_PUNCH_ONLY = false
         const val AnalysisFileName = "analysis.json"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
@@ -413,7 +402,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
             dropReplacedDocuments(releases)
             userProfileStore.save(name, document)
-            verdict?.let { rememberPunch(releases, it) }
             ParseResult.Parsed(releases, missing, name, verdict)
         } catch (error: CancellationException) {
             throw error
@@ -462,17 +450,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
-            /* The UserService runs in another process and receives only the
-             * GLK1 blob (no punch field), reading the punch from shared prefs.
-             * Publish it here so a device-derived `punch = "sigret"` profile
-             * reaches the Shizuku path too; otherwise it silently falls back
-             * to the MCAST_BLOCK_SOURCE punch and W1 writes nothing. */
-            if (!config.punch.isNullOrEmpty()) {
-                preferences.edit {
-                    putString(PrefPunchRelease, release)
-                    putString(PrefPunchMode, config.punch)
-                }
-            }
             /* A device-verified prebuilt GLK1 wins over conf resolution. */
             val prebuiltBlob = PrebuiltProfiles.prebuiltBlob(appContext, release)
             val profileBlob = prebuiltBlob ?: profileController.nativeDocument(config)
@@ -508,66 +485,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         profileBlob
                     }
                     dumpRuntimeProfile(archivedLog, writeSidecar, release, pair, runtimeBlob)
-                    if (DIAGNOSE_PUNCH_ONLY) {
-                        /* Diagnostic build: resolve and report every source the
-                         * punch could come from, then stop before native runs.
-                         * Nothing touches the kernel, so it is safe to repeat. */
-                        val rendered = runCatching {
-                            profileController.renderResolvedForDebug(release, pair)
-                        }.getOrNull()
-                        val carrier = runCatching {
-                            File(appContext.filesDir, PunchFileName).readText()
-                        }.getOrNull()
-                        val renderPunchLine = rendered?.lineSequence()
-                            ?.firstOrNull { it.trimStart().startsWith("punch") }
-                        val report = buildString {
-                            appendLine("release=$release")
-                            appendLine("config.punch=${config.punch}")
-                            appendLine("prefs.punch_mode=${punchMode(release)}")
-                            appendLine("carrier='$carrier'")
-                            appendLine("blobSize=${profileBlob.size}")
-                            appendLine("renderIsNull=${rendered == null}")
-                            appendLine("renderPunchLine=${renderPunchLine ?: "(none)"}")
-                            appendLine("renderLength=${rendered?.length ?: 0}")
-                            appendLine("--- rendered profile.conf ---")
-                            appendLine(rendered ?: "(null)")
-                        }
-                        writeSidecar("diagnose-punch.txt", report.toByteArray(StandardCharsets.UTF_8))
-                        archivedLog("<s> diagnose: attack skipped")
-                        archivedLog("<s> config.punch=${config.punch} prefs=${punchMode(release)}")
-                        archivedLog("<s> carrier='$carrier' renderPunch=${renderPunchLine ?: "(none)"}")
-                        archivedLog("<s> full report: diagnose-punch.txt in the dump dir")
-                        return@withDebugAttackLog 0
-                    }
                     archivedLog("<b> starting UserService")
                     // Boot discipline: record this boot; a second run in the
                     // same boot panics reliably.
                     BootGuard.markRun()
                     resetRunState()
-                    /* The punch selection goes across as a binder argument.
-                     * The service runs under uid 2000 and cannot read this
-                     * process's private files, so the punch.txt carrier always
-                     * came back empty there; SharedPreferences has the same
-                     * problem for a different reason (per-process cache). Keep
-                     * writing the file only for tooling that inspects it. */
-                    val effectivePunch = runCatching {
-                        val fromRender = runCatching {
-                            profileController.renderResolvedForDebug(release, pair)?.let { text ->
-                                Regex("(?m)^\\s*punch\\s*=\\s*\"([^\"]+)\"")
-                                    .find(text)?.groupValues?.get(1)
-                            }
-                        }.getOrNull()
-                        val resolved = sequenceOf(config.punch, fromRender, punchMode(release))
-                            .firstOrNull { !it.isNullOrBlank() && it != "null" }
-                        archivedLog(
-                            "<s> punch resolved='" + resolved + "' config=" + config.punch +
-                                " render=" + fromRender,
-                        )
-                        runCatching {
-                            File(appContext.filesDir, PunchFileName).writeText(resolved.orEmpty())
-                        }
-                        resolved
-                    }.getOrNull()
+                    /* The punch travels as a binder argument: the service
+                     * runs as uid 2000 and cannot read app-private storage,
+                     * nor does SharedPreferences cross processes. A prebuilt
+                     * blob is calibrated for sigret by definition. */
+                    val effectivePunch = if (prebuiltBlob != null) {
+                        "sigret"
+                    } else {
+                        resolvePunch(release, pair, config.punch)
+                    }
+                    archivedLog("<s> punch resolved='" + effectivePunch + "' config=" + config.punch)
                     shizukuRunner.run(
                         pair, safeModeEnabled, forceAttackTest, profileBlob, effectivePunch,
                         debugDir, archivedLog,
@@ -766,17 +698,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             var profileBlob = prebuiltBlob
                 ?: profileController.nativeDocument(config)
                 ?: error("profile is unavailable for $release")
-            /* The Shizuku UserService runs in its own process and receives only
-             * the GLK1 blob, which has no punch field. Publishing the resolved
-             * punch here keeps both launch paths on the same copy primitive;
-             * without it a device-derived `punch = "sigret"` profile silently
-             * falls back to the MCAST_BLOCK_SOURCE punch and W1 writes nothing. */
-            if (!config.punch.isNullOrEmpty()) {
-                preferences.edit {
-                    putString(PrefPunchRelease, release)
-                    putString(PrefPunchMode, config.punch)
-                }
-            }
             // v2: safe_mode lives in the meta section; there is no fixed slot
             // offset, so the blob is rescanned and rewritten.
             if (safeModeEnabled) {
@@ -855,8 +776,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                      * the same statement in its own `punch` key, so it keeps
                      * working after the preference store is cleared. */
                     if (prebuiltBlob != null ||
-                        config.punch == "sigret" ||
-                        punchMode(release) == "sigret"
+                        resolvePunch(release, pair, config.punch) == "sigret"
                     ) {
                         environment()["GL_PUNCH"] = "sigret"
                     }
@@ -1155,28 +1075,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return version in builtinProfiles.unames || importedOffsetsMatch(version)
     }
 
-    /** Remember which punch this release's profile needs. */
-    private fun rememberPunch(releases: List<String>, verdict: ParseVerdict) {
-        /* A punch only matters when something will actually run: an unusable
-         * kernel must not leave a stale GL_PUNCH behind for a later import. */
-        if (verdict.level == "unusable") return
-        val release = verdict.release?.takeIf { it in releases } ?: releases.firstOrNull() ?: return
-        val punch = verdict.punch ?: return
-        preferences.edit {
-            putString(PrefPunchRelease, release)
-            putString(PrefPunchMode, punch)
-        }
-    }
-
-    /** "sigret" when this release's profile needs the rt_sigreturn punch. */
-    private fun punchMode(release: String): String? {
-        if (preferences.getString(PrefPunchRelease, null) != release) return null
-        /* Older builds stored the string "null" when the resolved punch was
-         * absent; without this it travels into the carrier file verbatim and
-         * every consumer has to defend against it. */
-        return preferences.getString(PrefPunchMode, null)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() && it != "null" }
+    /* One source for the punch: the profile that is about to be applied.
+     * A preference mirror and a punch.txt carrier both existed to reach the
+     * Shizuku service process and neither could work - that process runs as
+     * uid 2000, so app-private storage is unreadable, and SharedPreferences
+     * does not cross processes. The value now travels as a binder argument;
+     * the rendered document is the fallback, for profiles whose key does not
+     * survive parsing. */
+    private fun resolvePunch(release: String, pair: CpuPair, declared: String?): String? {
+        declared?.trim()?.takeIf { it.isNotEmpty() && it != "null" }?.let { return it }
+        return runCatching {
+            profileController.renderResolvedForDebug(release, pair)?.let { text ->
+                Regex("(?m)^\\s*punch\\s*=\\s*\"([^\"]+)\"")
+                    .find(text)?.groupValues?.get(1)
+            }
+        }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
     }
 
     private fun importedOffsetsMatch(version: String): Boolean =

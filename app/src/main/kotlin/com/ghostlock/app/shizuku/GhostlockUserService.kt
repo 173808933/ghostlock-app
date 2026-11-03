@@ -97,32 +97,18 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         /* The prebuilt blob is calibrated for the 64-bit
                          * rt_sigreturn fpsimd punch; the default
                          * MCAST_BLOCK_SOURCE punch is infeasible on this kernel. */
-                        /* The binder argument is authoritative: it is the value
-                         * the app resolved from the profile it is about to
-                         * apply, and it crosses the process boundary with the
-                         * call itself. Everything below is a fallback, because
-                         * this service runs under uid 2000 and cannot read the
-                         * app's private files - punch.txt always comes back
-                         * empty here, and the preference store is per-process.
-                         * Both stay only for older callers on the old AIDL. */
-                        val prefs = context.getSharedPreferences(
-                            "ghostlock_prefs", android.content.Context.MODE_PRIVATE,
-                        )
-                        val importedSigret = prefs.getString("punch_release", null) == release &&
-                            prefs.getString("punch_mode", null) == "sigret"
-                        val carriedPunch = runCatching {
-                            File(context.filesDir, "punch.txt").readText().trim()
-                        }.getOrDefault("")
+                        /* The punch arrives with the call: this process is
+                         * uid 2000, so it can read neither the app's private
+                         * files nor a preference store shared with the app.
+                         * A prebuilt blob is calibrated for sigret by
+                         * definition, so that case needs no argument. */
                         val prebuiltBlob = PrebuiltProfiles.isPrebuilt(context, release, profileBlob)
-                        val useSigret = punch == "sigret" || prebuiltBlob ||
-                            carriedPunch == "sigret" || importedSigret
+                        val useSigret = punch == "sigret" || prebuiltBlob
                         if (useSigret) {
                             environment()["GL_PUNCH"] = "sigret"
                         }
                         callback.onLog(
-                            "<s> punch: binder='" + punch + "' carrier='" + carriedPunch +
-                                "' prebuilt=" + prebuiltBlob +
-                                " prefs=" + importedSigret +
+                            "<s> punch: binder='" + punch + "' prebuilt=" + prebuiltBlob +
                                 " -> " + (if (useSigret) "sigret" else "default"),
                         )
                     }
