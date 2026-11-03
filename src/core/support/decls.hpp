@@ -68,6 +68,10 @@ namespace ghostlock::support {
      * prebuild collision scan and the main write's second scan. See the call
      * site in the 43499 backend for why two scans run back to back. */
     void settle_w2_prebuild(void);
+
+    /* Same yield loop, generic label: used between W1 and the W1b scratch
+     * repair, where the second scan starts right behind the first. */
+    void settle_after_write(const char *label);
 } // namespace ghostlock::support
 
 #endif

@@ -539,6 +539,13 @@ namespace ghostlock::session::backend {
                     return StageResult::Failed;
                 }
                 support::run_state::complete("w1a");
+                /* W1b starts a second full collision scan right behind W1's
+                 * ~128 punch+walk cycles. On the 6.1.141 line the PSI reading
+                 * jumps from ~2e5 to ~4e7 across this boundary and the second
+                 * scan is SIGKILLed mid-route (consumer never releases, log
+                 * ends at "waiting route_done"). Let the previous round's
+                 * waiters expire before re-entering. */
+                if constexpr (M::multicast) support::settle_after_write("w1 w1b settle");
                 support::run_state::enter("w1b");
                 if (!w1_scratch_repair<M>(session)) return StageResult::Failed;
                 support::run_state::complete("w1b");

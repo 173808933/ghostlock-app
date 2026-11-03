@@ -780,8 +780,22 @@ namespace ghostlock::support {
         return 0;
     }
 
-    void settle_w2_prebuild(void) {
-        /* The W2 credential write runs two full KernelSnitch collision scans
+    /* A completed write leaves the futex subsystem saturated: the following
+     * collision scan spins wait/wake across every online CPU while the previous
+     * round's waiters are still timing out. Yielding in a loop (rather than
+     * sleeping) keeps this thread runnable so those waiters can expire, which
+     * is the state the next scan needs to observe. */
+    void settle_after_write(const char *label) {
+        constexpr useconds_t kSettleStepUs = 100000;   // 100ms
+        constexpr int32_t kSettleSteps = 3;            // 300ms total
+        for (int32_t i = 0; i < kSettleSteps; i++) {
+            sched_yield();
+            usleep(kSettleStepUs);
+        }
+        log_memory(label);
+    }
+
+    void settle_w2_prebuild(void) {        /* The W2 credential write runs two full KernelSnitch collision scans
          * back to back (prebuild page, then the main write). Each scan spins
          * futex wait/wake across every online CPU; on the qcom/other 6.1.141
          * line the subsystem is saturated by the ~128 punch+walk cycles of W1
