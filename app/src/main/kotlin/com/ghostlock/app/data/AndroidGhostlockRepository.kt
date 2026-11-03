@@ -1169,7 +1169,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /** "sigret" when this release's profile needs the rt_sigreturn punch. */
     private fun punchMode(release: String): String? {
         if (preferences.getString(PrefPunchRelease, null) != release) return null
+        /* Older builds stored the string "null" when the resolved punch was
+         * absent; without this it travels into the carrier file verbatim and
+         * every consumer has to defend against it. */
         return preferences.getString(PrefPunchMode, null)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && it != "null" }
     }
 
     private fun importedOffsetsMatch(version: String): Boolean =
