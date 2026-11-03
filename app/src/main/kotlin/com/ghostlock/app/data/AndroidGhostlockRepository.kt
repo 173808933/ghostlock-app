@@ -61,6 +61,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefPunchMode = "punch_mode"
         /* Cross-process carrier for the punch selection; see the write site. */
         const val PunchFileName = "punch.txt"
+        /* Diagnostic build only: resolve the punch and stop before native runs.
+         * Flip back to false for any build that is meant to attack. */
+        private const val DIAGNOSE_PUNCH_ONLY = false
         const val AnalysisFileName = "analysis.json"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
@@ -505,6 +508,37 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         profileBlob
                     }
                     dumpRuntimeProfile(archivedLog, writeSidecar, release, pair, runtimeBlob)
+                    if (DIAGNOSE_PUNCH_ONLY) {
+                        /* Diagnostic build: resolve and report every source the
+                         * punch could come from, then stop before native runs.
+                         * Nothing touches the kernel, so it is safe to repeat. */
+                        val rendered = runCatching {
+                            profileController.renderResolvedForDebug(release, pair)
+                        }.getOrNull()
+                        val carrier = runCatching {
+                            File(appContext.filesDir, PunchFileName).readText()
+                        }.getOrNull()
+                        val renderPunchLine = rendered?.lineSequence()
+                            ?.firstOrNull { it.trimStart().startsWith("punch") }
+                        val report = buildString {
+                            appendLine("release=$release")
+                            appendLine("config.punch=${config.punch}")
+                            appendLine("prefs.punch_mode=${punchMode(release)}")
+                            appendLine("carrier='$carrier'")
+                            appendLine("blobSize=${profileBlob.size}")
+                            appendLine("renderIsNull=${rendered == null}")
+                            appendLine("renderPunchLine=${renderPunchLine ?: "(none)"}")
+                            appendLine("renderLength=${rendered?.length ?: 0}")
+                            appendLine("--- rendered profile.conf ---")
+                            appendLine(rendered ?: "(null)")
+                        }
+                        writeSidecar("diagnose-punch.txt", report.toByteArray(StandardCharsets.UTF_8))
+                        archivedLog("<s> diagnose: attack skipped")
+                        archivedLog("<s> config.punch=${config.punch} prefs=${punchMode(release)}")
+                        archivedLog("<s> carrier='$carrier' renderPunch=${renderPunchLine ?: "(none)"}")
+                        archivedLog("<s> full report: diagnose-punch.txt in the dump dir")
+                        return@withDebugAttackLog 0
+                    }
                     archivedLog("<b> starting UserService")
                     // PHY110 discipline: record this boot; a second run in the
                     // same boot panics reliably.
@@ -515,8 +549,23 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                      * invisible to it. The punch selection therefore travels as a
                      * file, which both processes read from the same inode. */
                     runCatching {
-                        File(appContext.filesDir, PunchFileName)
-                            .writeText(config.punch ?: punchMode(release).orEmpty())
+                        /* config.punch is the parsed value, but the resolved
+                         * document is the one thing already proven to carry it
+                         * (it is what the debug dump writes). Fall back to
+                         * scanning its text before giving up on the preference
+                         * store, which only ever holds what an import recorded. */
+                        val fromRender = runCatching {
+                            profileController.renderResolvedForDebug(release, pair)?.let { text ->
+                                Regex("(?m)^\\s*punch\\s*=\\s*\"([^\"]+)\"")
+                                    .find(text)?.groupValues?.get(1)
+                            }
+                        }.getOrNull()
+                        val carried = config.punch ?: fromRender ?: punchMode(release).orEmpty()
+                        File(appContext.filesDir, PunchFileName).writeText(carried)
+                        archivedLog(
+                            "<s> punch carrier='" + carried + "' config=" + config.punch +
+                                " render=" + fromRender,
+                        )
                     }
                     shizukuRunner.run(
                         pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,

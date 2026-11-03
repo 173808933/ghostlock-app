@@ -259,8 +259,24 @@ internal class AndroidProfileConfigController(
     }
 
     /** The declared copy primitive, or null when the route default applies. */
-    private fun punchOf(profile: ValueMap): String? =
-        (profile["punch"] as? String)?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+    private fun punchOf(profile: ValueMap): String? {
+        val raw = profile["punch"]
+        /* `as? String` fails silently: a value the HOCON reader stored under a
+         * wrapper type (or an unquoted token) would vanish here and the run
+         * would quietly fall back to the default MCAST punch. Coerce anything
+         * textual instead, and log the shape when it is neither. */
+        val text = when (raw) {
+            null -> return null
+            is String -> raw
+            else -> raw.toString().also {
+                android.util.Log.w(
+                    "GhostLock",
+                    "punch: unexpected type ${raw.javaClass.simpleName} -> '$it'",
+                )
+            }
+        }
+        return text.trim().takeIf { it.isNotEmpty() && it != "null" }
+    }
 
     /** The single branch key declared under "route" (string legacy allowed). */
     private fun routeNameOf(profile: ValueMap): String? {
