@@ -53,11 +53,11 @@ internal class AndroidProfileConfigController(
         val full = resolveCurrent(deviceRelease, pair, advanced, includeImported = true)
         if (full == null) {
             cache(deviceRelease, null)
-            /* PHY110: the device-verified prebuilt GLK1 blob (assets/prebuilt/)
+            /* The device-verified prebuilt GLK1 blob (assets/prebuilt/)
              * is itself a valid profile for this release. The conf catalog
              * deliberately has no entry for it, so an unverified conversion can
              * never replace the calibrated blob. */
-            if (Phy110Profiles.prebuiltBlob(appContext, deviceRelease) != null) {
+            if (PrebuiltProfiles.prebuiltBlob(appContext, deviceRelease) != null) {
                 return ProfileConfig(release = deviceRelease, hasProfile = true)
             }
             return ProfileConfig(release = deviceRelease, hasProfile = false)
@@ -195,7 +195,7 @@ internal class AndroidProfileConfigController(
                      * security/user/user_ns pointer slots of the caller's own
                      * cred stay untouched, so no reference entries are needed
                      * and the copy may stay below 0xa0 - which is exactly the
-                     * shape of the device-verified PHY110 blob (copy_size 80,
+                     * shape of the device-verified Prebuilt blob (copy_size 80,
                      * caps_offset 48, 3 cap words, no refs). */
                 } else {
                     /* The multicast punch overwrites the whole credential

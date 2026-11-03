@@ -5,14 +5,14 @@ import android.content.Context
 /**
  * Bundled prebuilt profiles: `assets/prebuilt/<release>.glk1`.
  *
- * Every bundled entry is a PHY110 (OPPO Find X7 Ultra) artifact calibrated
+ * Every bundled entry is a Prebuilt artifact calibrated
  * and verified on the real device. Statically derived profiles for sibling
  * devices on the same kernel tree are deliberately NOT bundled: those devices
  * are expected to run the on-device derivation (parse a boot/Image and import
  * the generated profile) so that an unverified blob can never reach a device
  * that never produced it.
  *
- * For PHY110 the blob is the exact profile that was calibrated on hardware:
+ * For The prebuilt blob is the exact profile that was calibrated on hardware:
  *
  *   magic 0x0D000721, version 2, frontend 1, backend 1, route 3
  *   (multicast_waiter: waiter_off=0xe8, buffer_size=0x200, task_offset=0x30,
@@ -20,7 +20,7 @@ import android.content.Context
  *    execution.recommended_cpus (main=5, consumer=6).
  *
  * The HOCON converter cannot reproduce this blob byte for byte (the shipped
- * `ghostlock-phy110.conf` predates the multicast route calibration and
+ * `ghostlock-legacy conf predates the multicast route calibration and
  * describes the tcp_zerocopy route instead), so the prebuilt blob wins over
  * conf resolution whenever it exists for the running kernel.
  *
@@ -28,7 +28,7 @@ import android.content.Context
  * fpsimd bulk copy). The default MCAST_BLOCK_SOURCE setsockopt punch is
  * infeasible on this kernel, and an upstream prebuilt APK cannot be used.
  */
-object Phy110Profiles {
+object PrebuiltProfiles {
 
     private const val PREBUILT_DIR = "prebuilt"
 

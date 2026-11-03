@@ -473,8 +473,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     putString(PrefPunchMode, config.punch)
                 }
             }
-            /* PHY110: device-verified prebuilt GLK1 wins over conf resolution. */
-            val prebuiltBlob = Phy110Profiles.prebuiltBlob(appContext, release)
+            /* A device-verified prebuilt GLK1 wins over conf resolution. */
+            val prebuiltBlob = PrebuiltProfiles.prebuiltBlob(appContext, release)
             val profileBlob = prebuiltBlob ?: profileController.nativeDocument(config)
             if (prebuiltBlob != null) {
                 archivedLog(
@@ -540,9 +540,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         return@withDebugAttackLog 0
                     }
                     archivedLog("<b> starting UserService")
-                    // PHY110 discipline: record this boot; a second run in the
+                    // Boot discipline: record this boot; a second run in the
                     // same boot panics reliably.
-                    Phy110Guard.markRun()
+                    BootGuard.markRun()
                     resetRunState()
                     /* SharedPreferences is per-process: the UserService runs under
                      * its own pid, so a value written here after it started is
@@ -739,12 +739,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 "<k> profile: hasProfile=${config.hasProfile} " +
                     "invalid=${config.invalidPaths.size} release=$release",
             )
-            /* PHY110: the device-verified GLK1 v2 blob ships verbatim in
+            /* The device-verified GLK1 v2 blob ships verbatim in
              * assets/prebuilt/. It carries the calibrated multicast_waiter
              * geometry (route=3) and the tuned execution stages that the
              * conf converter cannot reproduce byte for byte, so it wins over
              * conf resolution whenever it exists for this kernel. */
-            val prebuiltBlob = Phy110Profiles.prebuiltBlob(appContext, release)
+            val prebuiltBlob = PrebuiltProfiles.prebuiltBlob(appContext, release)
             if (prebuiltBlob != null) {
                 onLog("<k> prebuilt GLK1 profile in use: ${prebuiltBlob.size} bytes (device-verified)")
             } else {
@@ -846,7 +846,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
-                    /* PHY110: the prebuilt blob is calibrated for the 64-bit
+                    /* The prebuilt blob is calibrated for the 64-bit
                      * rt_sigreturn fpsimd punch; the default
                      * MCAST_BLOCK_SOURCE punch is infeasible on this kernel.
                      * A profile imported from an on-device derivation carries
@@ -860,9 +860,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     }
                 }
             onLog("<b> starting native: ${binary.absolutePath}")
-            // PHY110 discipline: the futex subsystem stays armed after any run,
+            // Boot discipline: the futex subsystem stays armed after any run,
             // so record this boot and refuse a second run in the same boot.
-            Phy110Guard.markRun()
+            BootGuard.markRun()
             resetRunState()
             try {
                 val nativeCode = runProcess(
@@ -1144,12 +1144,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun isKernelSupported(): Boolean {
         val version = System.getProperty("os.version", "").orEmpty()
-        /* PHY110: a device-verified prebuilt GLK1 profile is itself a supported
+        /* A device-verified prebuilt GLK1 profile is itself a supported
          * kernel configuration. The conf catalog is deliberately left without
          * an entry for this release so that an unverified, converted profile
          * can never silently replace the calibrated blob (the prebuilt always
          * wins in the run paths below). */
-        if (Phy110Profiles.prebuiltBlob(appContext, version) != null) return true
+        if (PrebuiltProfiles.prebuiltBlob(appContext, version) != null) return true
         return version in builtinProfiles.unames || importedOffsetsMatch(version)
     }
 

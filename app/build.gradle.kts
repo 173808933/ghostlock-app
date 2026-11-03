@@ -21,9 +21,9 @@ val gitVersionCode = runCatching {
         commandLine("git", "rev-list", "--count", "HEAD")
     }.standardOutput.asText.get().trim().toInt()
 }.getOrElse {
-    /* PHY110 tree: not a git checkout, so the upstream count is unavailable.
+    /* No git checkout, so the upstream commit count is unavailable.
      * Pin the baseline instead of "1": this fork is built on upstream 583
-     * (commit 5d675e2) plus the device-verified PHY110 additions, and the
+     * (commit 5d675e2) plus the device-verified device additions, and the
      * number is what the release page and the in-app status line compare. */
     logger.warn("git rev-list failed (${it.message}); versionCode pinned to baseline 583")
     583

@@ -6,7 +6,7 @@ import android.os.SystemClock
 import kotlin.math.abs
 
 /**
- * PHY110 run discipline, encoded from the device-verified operating rules.
+ * Run discipline, encoded from the device-verified operating rules.
  *
  * Two hard rules were paid for with kernel panics on the reference device:
  *
@@ -40,9 +40,9 @@ import kotlin.math.abs
  * auto-reboot after a panic correctly re-arm the button instead of nagging
  * the user to restart a device that already restarted.
  */
-object Phy110Guard {
+object BootGuard {
 
-    private const val PREFS = "phy110_guard"
+    private const val PREFS = "boot_guard"
     private const val KEY_LAST_RUN_ELAPSED = "last_run_elapsed_realtime"
     private const val KEY_LAST_RUN_WALL = "last_run_wall_clock"
     private const val KEY_LAST_RUN_TS = "last_run_ts"

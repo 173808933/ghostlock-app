@@ -23,7 +23,7 @@ import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
-import com.ghostlock.app.data.Phy110Guard
+import com.ghostlock.app.data.BootGuard
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -882,9 +882,9 @@ class GhostlockViewModel(
             }
             return
         }
-        /* PHY110 run discipline: wait for the startup storm to pass, and never
+        /* Run discipline: wait for the startup storm to pass, and never
          * run twice in the same boot (the second run panics reliably). */
-        val gate = Phy110Guard.check()
+        val gate = BootGuard.check()
         if (!gate.ok) {
             if (beginOperation()) {
                 appendLog("gate: ${gate.message}")

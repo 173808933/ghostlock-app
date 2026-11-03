@@ -4,7 +4,7 @@ import android.content.Context
 import android.os.Process
 import androidx.annotation.Keep
 import com.ghostlock.app.data.NativeProfileDocument
-import com.ghostlock.app.data.Phy110Profiles
+import com.ghostlock.app.data.PrebuiltProfiles
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicBoolean
@@ -93,7 +93,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         environment()["TMPDIR"] = workDir.absolutePath
                         environment()["HOME"] = workDir.absolutePath
                         environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
-                        /* PHY110: the prebuilt blob is calibrated for the 64-bit
+                        /* The prebuilt blob is calibrated for the 64-bit
                          * rt_sigreturn fpsimd punch; the default
                          * MCAST_BLOCK_SOURCE punch is infeasible on this kernel. */
                         val prefs = context.getSharedPreferences(
@@ -108,7 +108,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         val carriedPunch = runCatching {
                             File(context.filesDir, "punch.txt").readText().trim()
                         }.getOrDefault("")
-                        val prebuiltBlob = Phy110Profiles.isPrebuilt(context, release, profileBlob)
+                        val prebuiltBlob = PrebuiltProfiles.isPrebuilt(context, release, profileBlob)
                         val useSigret = prebuiltBlob || carriedPunch == "sigret" || importedSigret
                         if (useSigret) {
                             environment()["GL_PUNCH"] = "sigret"
