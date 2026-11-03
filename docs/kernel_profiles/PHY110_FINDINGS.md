@@ -69,25 +69,38 @@ W3 的命中率同样不高（一次成功样本里试了 5 轮 route），`w3_a
 
 ## 五、Shizuku 路径的 punch 传递
 
-`GL_PUNCH` 只在这一处判定：
+**跨进程唯一可靠的方式是 binder 参数**，不是文件，也不是 prefs。
 
-```kotlin
-val useSigret = prebuiltBlob || carriedPunch == "sigret" || importedSigret
+UserService 跑在 uid 2000，app 的 `filesDir` 属主是 app uid，`punch.txt`
+读出来是 `EACCES`，被 `runCatching` 吞成空串。日志里两侧对不上就是这么来的：
+
+```
+app 侧        <s> punch carrier='sigret' config=sigret render=sigret
+service 侧    <s> punch: carrier='' prebuilt=false prefs=false -> default
 ```
 
-三个来源都必须保留，因为各自覆盖不同场景：
+所以 `runExploit(..., @nullable String punch, ...)` 直接带参数过去。判据：
+
+```kotlin
+val useSigret = punch == "sigret" || prebuiltBlob ||
+    carriedPunch == "sigret" || importedSigret
+```
+
+后三个只是老调用方的兜底：
 
 | 来源 | 覆盖场景 | 失效条件 |
 |---|---|---|
+| **binder `punch`** | 全部（app 解析后随调用送达） | AIDL 版本不匹配 |
 | `prebuiltBlob` | assets 里带的校准 blob | 该 release 没有 prebuilt |
-| `carriedPunch`（`filesDir/punch.txt`） | 手动导入、迁移过的 profile | 文件写失败 |
-| `importedSigret`（prefs） | 走过 app 导入流程的 profile | **跨进程不可见** |
+| `carriedPunch`（`filesDir/punch.txt`） | 同 uid 进程 | **uid 2000 读不了 app 私有目录** |
+| `importedSigret`（prefs） | 走过 app 导入流程 | **跨进程不同步** |
 
-`SharedPreferences` 在 app 进程与 UserService 进程之间**不做同步**，各自缓存。
-所以载体必须是文件，不能是 prefs。
+改 AIDL 后必须同步 bump `UserServiceArgs.version(...)`，否则 Shizuku 会复用
+按旧接口解压出来的 dex，服务端仍是旧代码。
 
-写载体时优先取 `config.punch`，为空则扫描 `renderResolvedForDebug()` 的输出——
-后者是 debug dump 用的那份文本，实测一定带 `punch` 行。
+app 侧取值顺序：`config.punch` → `renderResolvedForDebug()` 的 `punch` 行 → prefs。
+`punchOf()` 里曾用 `as? String`，遇到非字符串类型静默返回 null，于是载体被写成
+字面量 `"null"`——`punchMode()` 现在也过掉这个值。
 
 ## 六、不要把别人的 fork 改动直接套用
 
