@@ -82,18 +82,19 @@ service 侧    <s> punch: carrier='' prebuilt=false prefs=false -> default
 所以 `runExploit(..., @nullable String punch, ...)` 直接带参数过去。判据：
 
 ```kotlin
-val useSigret = punch == "sigret" || prebuiltBlob ||
-    carriedPunch == "sigret" || importedSigret
+val useSigret = punch == "sigret" || prebuiltBlob
 ```
 
-后三个只是老调用方的兜底：
+判据只剩两条，没有第三条：
 
 | 来源 | 覆盖场景 | 失效条件 |
 |---|---|---|
 | **binder `punch`** | 全部（app 解析后随调用送达） | AIDL 版本不匹配 |
-| `prebuiltBlob` | assets 里带的校准 blob | 该 release 没有 prebuilt |
-| `carriedPunch`（`filesDir/punch.txt`） | 同 uid 进程 | **uid 2000 读不了 app 私有目录** |
-| `importedSigret`（prefs） | 走过 app 导入流程 | **跨进程不同步** |
+| `prebuiltBlob` | assets 里带的校准 blob（天然是 sigret） | 该 release 没有 prebuilt |
+
+`filesDir/punch.txt` 与 `punch_release`/`punch_mode` 两个 prefs 键已经删除。
+它们各自因为权限（uid 2000 vs app 私有目录）和进程隔离（SharedPreferences
+不跨进程）永远读不到，留在分支上只会让下一个人以为还有别的通道。
 
 改 AIDL 后必须同步 bump `UserServiceArgs.version(...)`，否则 Shizuku 会复用
 按旧接口解压出来的 dex，服务端仍是旧代码。
@@ -114,9 +115,10 @@ val useSigret = punch == "sigret" || prebuiltBlob ||
 整条链路 23.5 秒，W1 用掉两次抽签、W1b 与 W2 各一次。`carrier=''` 是预期值——
 文件通道在这个方向上永远读不到，`binder=` 才是实际生效的那个。
 
-app 侧取值顺序：`config.punch` → `renderResolvedForDebug()` 的 `punch` 行 → prefs。
-`punchOf()` 里曾用 `as? String`，遇到非字符串类型静默返回 null，于是载体被写成
-字面量 `"null"`——`punchMode()` 现在也过掉这个值。
+app 侧解析集中在一处 `resolvePunch()`：`config.punch` → `renderResolvedForDebug()`
+的 `punch` 行。direct 与 Shizuku 两条路径都调它，不再各写一份。
+`punchOf()` 里曾用 `as? String`，遇到非字符串类型静默返回 null；`resolvePunch`
+现在统一 trim 并过掉字面量 `"null"`。
 
 ## 六、不要把别人的 fork 改动直接套用
 
