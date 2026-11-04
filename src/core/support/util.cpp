@@ -177,6 +177,10 @@ namespace ghostlock::support {
                    (unsigned long long) ghostlock::profile::slide_init_task(),
                    (unsigned long long) ghostlock::profile::slide_root_task_group(),
                    (unsigned long long) ghostlock::profile::slide_sysctl_bootid());
+        /* Everything above is the last thing a run that dies during setup ever
+         * prints. Without a sync here those lines exist only in the page cache,
+         * and a panic leaves a file with the right size and no content. */
+        ghostlock::support::log_sync();
     }
 
     void disable_rseq_for_thread(void) {

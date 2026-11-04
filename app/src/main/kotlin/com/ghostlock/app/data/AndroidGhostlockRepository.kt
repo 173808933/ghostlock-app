@@ -822,6 +822,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     tailer.join(1000)
                     tailKsuLog(nativeLog, nativeOffset, onLog)
                     tailKsuLog(ksuLog, ksuOffset, ksuSink)
+                    /* This run reached its epilogue and wrote its own archive;
+                     * clearing keeps the next start from reporting it as a
+                     * crash. A panic never gets here, which is the point. */
+                    NativeLogRecovery.clear(appContext)
                 }
             }
         } catch (error: CancellationException) {

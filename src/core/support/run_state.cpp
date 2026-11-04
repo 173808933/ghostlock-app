@@ -18,6 +18,10 @@ namespace ghostlock::support::run_state {
             const std::string line = format_event(step, status);
             std::fwrite(line.data(), 1, line.size(), stdout);
             std::fflush(stdout);
+            /* stdout is the run log. Stage boundaries are the only cheap places
+             * to pay for an fsync, and they are exactly the points a crash
+             * report needs: they say which stage was entered last. */
+            (void) ::fsync(STDOUT_FILENO);
         }
 
         /* Reads one newline-terminated line from stdin with a bounded wait and

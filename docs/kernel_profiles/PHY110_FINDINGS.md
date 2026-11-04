@@ -139,14 +139,37 @@ app 侧解析集中在一处 `resolvePunch()`：`config.punch` → `renderResolv
 
 1. `main()` 一进来就解析 profile、算地址，第一个 `[T+]` 标记之前没有任何输出
 2. 只有 `timer_mark` 和 `log_sync` 调用点会 `fsync`，普通 `pr_info` 只到页缓存
-3. `/sdcard` 的 SELinux 标签是 `fuse`，`fsync` 只保证交给 MediaProvider
+3. **日志归档走 FUSE**：`/sdcard` 的 `fsync` 只把数据交给 MediaProvider，MediaProvider
+   真正写进 f2fs 是异步的；panic 时它也一起死，缓冲全丢
 
-现在 `main()` 开头会先打一行并 `fsync`：
+第 3 条是"文件有 216 字节、内容全是 NUL"的来源：size 通过 inode 更新提交了，
+数据块还在 page cache 里。**只要 panic 就是必然，不是偶发。**
 
-| 日志内容 | 判读 |
+现在的分工：
+
+| 位置 | 文件 | 特性 |
+|---|---|---|
+| app 私有目录 | `filesDir/.ghostlock_native.log` | f2fs 普通文件，`fsync` 真落盘；native 的 stdout 直接重定向到这里 |
+| Download 归档 | `ghostlock-<entry>-<n>.log` | 用户可读，panic 时丢尾 |
+
+落盘点（一次运行约十几次，不影响时序）：
+
+- `main()` 首行 `native start`
+- `log_startup_context()` 末尾（`p0 profile` 之后，即开始攻击前）
+- `run_state::emit`（每个 stage 边界）
+- `timer_mark`
+
+正常退出时 app 清空私有目录那份，所以**文件非空就代表上次是异常结束**。
+下次启动 `GhostlockApplication` 会把它搬到
+`Download/<exportLocation>/<stamp>-recovered/ghostlock-native-crash.log`。
+
+判读：
+
+| 日志内容 | 说明 |
 |---|---|
 | 空文件 | native 没起来（动态链接 / seccomp / SELinux） |
 | 只有 `native start` | 死在 profile 解码或地址解析 |
+| 到 `p0 profile` 为止 | 死在开始攻击前（几何/地址计算） |
 | 有 `[T+0ms] exploit start` | 死在攻击流程，看最后一个 T+ 标记 |
 
 日志目录无法迁到 `/data/local/tmp`：该目录标签为 `shell_data_file`，
