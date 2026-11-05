@@ -15,7 +15,10 @@ on:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
+  # Pull requests may cancel each other, pushes may not: the pre-release only
+  # publishes when every job finishes, and a cancelled macOS job silently
+  # skipped the release for a whole day of pushes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ONDK_VERSION: "r30.1"
@@ -167,6 +170,9 @@ jobs:
   build-extractor-macos:
     name: Build Extractor (macOS)
     runs-on: macos-latest
+    # The macOS extractor is a convenience binary; a flaky runner must not be
+    # able to block the APK release.
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -240,7 +246,7 @@ jobs:
     name: Pre-release
     needs: [build-apk, build-extractor-macos, build-extractor-windows]
     runs-on: ubuntu-latest
-    if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && github.ref_type != 'tag' }}
+    if: ${{ !cancelled() && needs.build-apk.result == 'success' && github.event_name != 'pull_request' && github.ref == 'refs/heads/sigret' && github.ref_type != 'tag' }}
     permissions:
       contents: write
     steps:
