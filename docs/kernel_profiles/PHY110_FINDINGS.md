@@ -47,6 +47,19 @@ waiter 才能按时超时退出。
   而 W1 要求 `(page_base >> 16) & 1 == 1`（否则写 `selinux_state.initialized` 的值
   是偶数，后续每次 SID 查找都会失败）。连续 5 次抽到同一段 64KB 区间，加次数救不了。
 
+**`errno=35` 也不代表原语存在。** `CMP_REQUEUE_PI` 返回 `EDEADLK` 只说明 futex 的
+死锁检测发现了一个环，这是 `rt_mutex` 的常规逻辑。43499 的漏洞点在**清理路径**：
+`remove_waiter` 该用 `waiter->task` 却用了 `current`。修好之后，死锁照样能造、
+`EDEADLK` 照样返回、`route_done` 照样 `success=1`，但 `pi_blocked_on` 被正确清理，
+没有悬挂指针，punch 写过去什么也打不中——表现就是"参数全对、日志全绿、Write 失败"。
+
+2026-11 在 iQOO Z9 Turbo+（`6.1.145-android14-11-maybe-dirty`）上就是这个组合：
+`requeue try=200 ret=-1 errno=35` → `route_done success=1` → `Write 1 failed`，
+而反汇编显示该内核 `remove_waiter` 已改用 `waiter->task`。
+
+判断原语只有两条路：反汇编看 `remove_waiter` 里有没有 `mrs x?, sp_el0`，或者真机上
+看 W1 能不能变 permissive。日志里的 errno 一概不能作数。
+
 ## 四、W3 在 app 流程可以成功
 
 上游的 fork `b0r1s-69` 在 6.6.118 上记录过：`WriteMode::Zero` 写 `thread_info.flags`
@@ -188,8 +201,87 @@ adb shell su -c 'ls /data/adb/ksu'
 adb shell su -c 'ls /data/adb/modules'
 ```
 
-卸载 KernelSU 时注意：**只卸管理器不够**，模块目录残留会在重启后继续加载。正确顺序是
-先删/禁用所有模块 → 卸载框架 → 重启 → 确认 `su` 失败 → 再跑 exploit。
+**但要看是哪种 root。** 实测两台 GT5 Pro：GhostLock late-load 进去的 KernelSU 是
+**纯内存态**，重启后 `su` 直接不存在，`/data/adb` 里的文件虽然还在但不生效。
+
+```bash
+# 重启后立刻查，这一条就能分清
+adb shell su -c id
+```
+
+- `su: inaccessible or not found` → 内存态，内核已回到原版，可以直接跑 exploit
+- 返回 `uid=0 ... u:r:ksu:s0` → 配了开机自启（`boot-completed.d` / `service.d`），
+  内核被重新 hook，必须先处理
+
+真正需要"先删模块、再卸框架、再重启"的是后一种。对内存态而言卸载管理器即可，
+`/data/adb` 残留不会自己加载。
 
 同理，调度类模块（如 "sense 调度"）会改动 `sched_setattr` / `pick_next_task` 的行为，
 直接破坏 PI 死锁的时序，表现为 `CMP_REQUEUE_PI` 之后卡在 `waiting route_done`。
+
+## 九、同 uname 不等于同一内核
+
+vivo 的内核 release 里 `-maybe-dirty` 不带 commit hash，所以**同一个 uname 下可以有
+多个不同的内核**。iQOO 12 的三份 glk1 和 iQOO Z9 Turbo+ 的分析结果都是
+`6.1.145-android14-11-maybe-dirty`，但：
+
+| 样本 | `remove_waiter` | 43499 | 可用 |
+|---|---|---|---|
+| iQOO 12（三份 glk1，内容哈希区分） | 仍读 `current` | 未修 | ✅ multicast |
+| iQOO Z9 Turbo+（`boot.img` 实测） | `waiter->task`，函数体内 0 处 `sp_el0` | 已修 | ❌ |
+
+两者 `release` 字符串逐字节相同。**按 uname 匹配 profile 会串号**，用户看到"受支持"
+却必然 `Write 1 failed`。
+
+区分办法，按可靠性排序：
+
+1. 反汇编 `remove_waiter`（最硬，工作量也最大）
+2. `linux_banner` 里的编译器指纹（`Image` 偏移 `0x10d0108` 附近）：
+   `Linux version ... clang version 17.0.2 (... d9f89f4d...)`——同一批构建会一致，
+   但不同批次能分开
+3. glk1 的内容哈希（`tools/` 的缓存键已经这么做了）
+
+**凡是 `-maybe-dirty` 的 release，导入前必须确认 profile 的来源设备。**
+
+## 十、成功率与温度
+
+2026-11-05 在 GT5 Pro（`RMX3888` / `6.1.141-o-g6ed3e67335d5`）上做了 5 轮真机测试，
+每轮都是"重启 → 静置 180s → 点执行"：
+
+| 轮次 | 结果 | 失败点 |
+|---|---|---|
+| 1 | ✅ 完整成功（含 W3 与 KernelSU module loaded） | — |
+| 2 | ❌ panic | W2 punch 之后（`T+18320ms PI route done` 后无输出） |
+| 3 | ❌ panic | W1b spray 之后、route 之前 |
+| 4 | ✅ 完整成功 | — |
+| 5 | ❌ 失败 | — |
+
+**成功率约 40%**，且失败点分布在整个 W1→W2 区间。
+
+关键性质：**W1 失败是安全的**（打空 → `Write 1 failed` → 干净退出），
+**W1b 和 W2 失败必然 panic**——它们写的是 page 结构 / `task->cred`，写偏就是内存破坏，
+进程下一次访问就崩。所以"重试"的真实代价是重启，用户观感就是"一直失败"。
+
+失败时几何与偏移全部正确（`W2 target = perf task + 0x838`，逐字节对上），差异只有
+KASLR slide 和抽签运气。两次成功与三次失败的日志除地址外没有结构性差别。
+
+**温度是已确认的相关因素**（实测）：
+
+```
+cpuss-0=45.7C  cpuss-1=45.3C  cpuss-2=46.1C  cpuss-3=45.7C
+cpu-2-0-1=46.9C
+cpu4=960MHz / 2438MHz   cpu5=1190MHz / 2438MHz   cpu6=1190MHz / 2438MHz
+```
+
+PI race 的窗口是硬编码的 `arm_hold=20000us`（20ms），consumer 必须在窗口内完成
+`sched_setattr(nice=1)` 才能把优先级链踢起来。热节流压低频率后这一脚会迟到，
+链断掉，punch 落偏。**设备刚开机就在 45~47°C、频率只有最大值的 39~49%**。
+
+运行前会记录一行：
+
+```
+<k> thermal: cpuss-2=46.1C cpu-2-0-1=46.9C cpuss-0=45.7C (HOT - ...)
+```
+
+阈值 45°C 只提示不阻断。**收集足够多的"温度 × 结果"对照后再决定是否门控**——
+目前两次成功时的温度没有记录，45°C 这个线还是经验值。
