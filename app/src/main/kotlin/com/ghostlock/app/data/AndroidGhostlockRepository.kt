@@ -579,7 +579,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         run: suspend ((String) -> Unit, String?, (String, ByteArray) -> Boolean) -> Int,
     ): Int {
         val settings = debugSettings()
-        if (!settings.exportEnabled) return run(onLog, null) { _, _ -> false }
+        /* Recorded before anything else: with a 20 ms race window, the clock the
+         * SoC is running at is part of the input, and a run that fails hot is
+         * not the same result as a run that fails cold. */
+        val thermal = runCatching { ThermalGuard.describe() }.getOrNull()
+        if (!settings.exportEnabled) {
+            thermal?.let { onLog("<k> $it") }
+            return run(onLog, null) { _, _ -> false }
+        }
         val archive = DebugAttackLog.open(appContext, entry, settings.exportLocation)
         if (archive == null) {
             onLog("<k> warning: cannot create ${settings.exportLocation} debug log")
@@ -600,6 +607,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             )
             archivedLog("<k> debug log: ${archive.folderPath}/${archive.displayName}")
             archivedLog("<k> debug dump dir: ${archive.folderFile.absolutePath}")
+            archivedLog("<k> ${thermal ?: "thermal: unavailable"}")
             run(
                 archivedLog,
                 if (settings.kernelLogEnabled) archive.folderFile.absolutePath else null,
