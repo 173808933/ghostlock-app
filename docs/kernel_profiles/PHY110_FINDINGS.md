@@ -335,9 +335,26 @@ confidence {
 _text          0xffffff8008080000      (text_offset 0x80000 + phys 0x80000000)
 kernel_phys    0x0000000080080000
 镜像           未压缩 ARM64 Image，51.5 MB（header 的 image_size 含 BSS，不是截断）
-kallsyms       工具找不到（4.19 布局与 5.x 不同），需真机 /proc/kallsyms
+kallsyms       已从镜像恢复，139658 条（见下）
 BTF            无（5.2 才有）⇒ 我们的几何推导链不适用
 ```
+
+4.19 的 kallsyms 布局与 5.x 不同，工具找不到。实测位置：
+
+```
+0x1f80600  kallsyms_offsets      s32 x 139658，升序，[0] = 0
+0x2008e00  kallsyms_num_syms     u32 = 139658
+0x2008f00  kallsyms_names        字节流，止于 0x21e0529
+0x21e1800  kallsyms_token_table  256 token，0x35e 字节
+0x21e1c00  kallsyms_token_index  u16 x 256（前有 0xa2 字节填充）
+```
+
+两个坑：`token_index` 存的是表内偏移不是序号；`names` 与 `token_table` 都按 256 字节
+对齐，"紧邻其后"的假设一律不成立。
+
+原语确认：`remove_waiter` @ `_text+0xcda38` 有 `mrs x20, sp_el0`，随后
+`add x21, x20, #0x8c4`（`&current->pi_lock`），同一函数里另有 `ldr [x19,#0x18]`
+（`waiter->pi_tree`）—— 与修补后直接用 `waiter->task` 的形态不同，**未修补**。
 
 结论：**我们的链在这台上跑不了，原因不是原语**。
 
@@ -348,6 +365,21 @@ BTF            无（5.2 才有）⇒ 我们的几何推导链不适用
 社区有现成的 4.19 实现（`yijiacloud/ghostlock-cve-2026-43499-4.19-k40`），但它的
 `target.h` 对应的是**另一个 build**：`4.19.157-perf-g9607d8651312`、Android 13、
 boot header v3。和 Find X3 只是同一个 release 前缀。
+
+**结构体偏移不能整体平移**，实测三组：
+
+| 字段 | Find X3 | K40 | 差 |
+|---|---|---|---|
+| `task->real_cred` / `cred` | `0x7d8` / `0x7e0` | `0x7e0` / `0x7e8` | **−8** |
+| `task->pi_lock` | `0x8c4` | `0x8b4` | **+0x10** |
+| `task->pi_blocked_on` | `0x8e8` | `0x8d8` | **+0x10** |
+
+方向相反说明两个 build 在 `cred` 前后各自增减过字段，必须逐条反汇编确认。
+`rt_mutex_waiter`（task 0x30 / lock 0x38 / prio 0x40）由结构定义决定，两边一致。
+
+符号侧可自动填 17 个（`init_task` / `selinux_state` / `ashmem_fops` …），但
+`configfs_read_iter`、`configfs_bin_write_iter`、`ashmem_misc_fops`、`copy_splice_read`
+在本镜像里不存在（内联或未编译），**K40 那套 ashmem→pipe→fops 尾部不能原样搬**。
 
 不过它的**全局常量是对得上的**：
 
