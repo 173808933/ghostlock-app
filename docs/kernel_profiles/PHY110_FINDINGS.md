@@ -285,3 +285,77 @@ PI race 的窗口是硬编码的 `arm_hold=20000us`（20ms），consumer 必须�
 
 阈值 45°C 只提示不阻断。**收集足够多的"温度 × 结果"对照后再决定是否门控**——
 目前两次成功时的温度没有记录，45°C 这个线还是经验值。
+
+## 十一、profile 里哪些字段是"猜"的
+
+生成的 profile 混了三类值，写进文件后长得一模一样：
+
+```
+[A] kallsyms 直接读到        init_task / selinux_enforcing / security_hook_heads
+[B] 结构布局推导             task_struct.* / cred.* / kernelsnitch.mm_struct_sz
+[C] 版本稳定常量             rt_mutex_waiter = 0x58（6.1）
+[D] 假设，未在硬件上验证      kernel_phys_offset（DRAM base）
+```
+
+`[D]` 里 **`kernel_phys_offset` 最贵**：它一次平移所有符号。值错了，日志会显示
+route 成功、punch 打出去了、目标却没变——和"几何推错"一模一样，于是排查的人会去
+翻 punch 代码，而问题在一个常量上。
+
+所以 profile 现在可以声明：
+
+```hocon
+confidence {
+  assumed = [ "kernel_phys_offset", "kernel_phys_load" ]
+}
+```
+
+- 没声明的字段按"已推导"处理，**旧 profile 无需改动**
+- 生成器（`extract_rs --format conf`）在拿不到 DRAM base 时自动写这两项
+- app 还会补上自己看得出的：`kernel_phys_offset` 缺失时 native 会退回编译期默认值，
+  那本身就是对这颗内核的猜测。**所以几个月前生成的 profile 也会得到正确提示**
+
+运行日志里：
+
+```
+<k> profile assumptions (2, not measured): kernel_phys_offset, kernel_phys_load
+<k>   kernel_phys_offset - a wrong DRAM base shifts every symbol at once, ...
+```
+
+退出码 1（route 成功但目标没变）时会在末尾再列一次；137/143 是进程被杀，与 profile
+无关，不输出。
+
+## 十二、4.19 这条边界
+
+`--analysis` 现在会在 < 5.10 的内核上也跑一遍（只读）。版本门仍然拦"生成 profile"，
+但不再拦"看一眼"，因为 4.x 用户唯一能行动的答案就是"原语还在不在"。
+
+实测 **OPPO Find X3**（`4.19.157-perf+`，SM8250，boot header v2）：
+
+```
+_text          0xffffff8008080000      (text_offset 0x80000 + phys 0x80000000)
+kernel_phys    0x0000000080080000
+镜像           未压缩 ARM64 Image，51.5 MB（header 的 image_size 含 BSS，不是截断）
+kallsyms       工具找不到（4.19 布局与 5.x 不同），需真机 /proc/kallsyms
+BTF            无（5.2 才有）⇒ 我们的几何推导链不适用
+```
+
+结论：**我们的链在这台上跑不了，原因不是原语**。
+
+1. `< 5.10` 没有 KernelSU late-load 的 KMI ⇒ 即使拿到 root 也装不了模块
+2. 没有 BTF ⇒ `extract_rs` 无法生成 profile（`cred.*`／`task_struct.*` 全靠 BTF）
+3. sigret 几何模型是 6.x 的栈帧；4.19 的 `rt_mutex_waiter` 布局与编译结果都不同
+
+社区有现成的 4.19 实现（`yijiacloud/ghostlock-cve-2026-43499-4.19-k40`），但它的
+`target.h` 对应的是**另一个 build**：`4.19.157-perf-g9607d8651312`、Android 13、
+boot header v3。和 Find X3 只是同一个 release 前缀。
+
+不过它的**全局常量是对得上的**：
+
+```
+KIMAGE_TEXT_BASE 0xffffff8008080000     ← 与 Find X3 完全一致
+P0_PHYS_OFFSET   0x80000000             ← 同
+```
+
+所以 4.19 oplus 这批的地址空间布局是统一的，**只差逐 build 的符号偏移**。要真做，
+第一步是在有 root 的机器上导出 `/proc/kallsyms`，再按 PoC 的 `target.h` 逐项填。
+
