@@ -452,6 +452,39 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         .collect();
     push_conf_block(&mut lines, "offset", &offset);
 
+    /* What the generator could not measure, stated in the file so that a later
+     * failure is traced to the assumption instead of to the geometry.
+     *
+     * A missing DRAM base is the expensive case: native substitutes a compiled
+     * default, which shifts *every* symbol at once. The run then reports a
+     * clean route and a write that lands on an unrelated page - the exact
+     * shape that sends its owner hunting for a punch bug that does not exist.
+     * Absent fields are omitted from the block rather than listed as empty, so
+     * an old profile and a fully derived one read the same way: nothing
+     * declared, nothing assumed beyond what the app can infer on its own. */
+    let mut assumed: Vec<&str> = Vec::new();
+    if input.phys_offset.is_none() {
+        assumed.push("kernel_phys_offset");
+    }
+    if input.phys.is_none() {
+        assumed.push("kernel_phys_load");
+    }
+    if !assumed.is_empty() {
+        lines.push(
+            "# Confidence: A kallsyms direct, B struct layout (BTF/RELA), \
+             C version-stable,"
+                .to_string(),
+        );
+        lines.push(
+            "# D assumption. `assumed` lists the D fields; every other value here was derived."
+                .to_string(),
+        );
+        lines.push("confidence {".to_string());
+        let quoted: Vec<String> = assumed.iter().map(|path| format!("\"{path}\"")).collect();
+        lines.push(format!("  assumed = [ {} ]", quoted.join(", ")));
+        lines.push("}".to_string());
+    }
+
     lines.join("\n") + "\n"
 }
 
@@ -960,7 +993,7 @@ mod tests {
         );
 
         for key in bundled.keys() {
-            if key == "recommend_shizuku" {
+            if key == "recommend_shizuku" || key.starts_with("confidence.") {
                 continue;
             }
             assert_eq!(
@@ -969,8 +1002,13 @@ mod tests {
                 "field {key} differs between generated and bundled profile"
             );
         }
-        // And the generated profile carries no extra non-comment field.
+        // And the generated profile carries no extra non-comment field. The
+        // confidence block is metadata about provenance, not a kernel value, so
+        // it is allowed to be present without the bundled file repeating it.
         for key in generated.keys() {
+            if key.starts_with("confidence.") {
+                continue;
+            }
             assert!(
                 bundled.contains_key(key),
                 "generated profile has unexpected field {key}"

@@ -12,6 +12,7 @@ import androidx.core.net.toUri
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.BuildInfo
 import com.ghostlock.app.KeepAliveService
+import com.ghostlock.app.domain.model.Assumption
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.KernelSnapshot
@@ -500,6 +501,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         resolvePunch(release, pair, config.punch)
                     }
                     archivedLog("<s> punch resolved='" + effectivePunch + "' config=" + config.punch)
+                    if (prebuiltBlob == null) logAssumptions(config.assumptions, archivedLog)
                     shizukuRunner.run(
                         pair, safeModeEnabled, forceAttackTest, profileBlob, effectivePunch,
                         debugDir, archivedLog,
@@ -712,6 +714,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 profileBlob = NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
             }
             dumpRuntimeProfile(onLog, writeSidecar, release, pair, profileBlob)
+            /* The prebuilt blob is the one profile that was calibrated on
+             * hardware; its conf-side assumptions (if any) do not apply. */
+            if (prebuiltBlob == null) logAssumptions(config.assumptions, onLog)
             val ksuOffset = AtomicLong()
             val nativeOffset = AtomicLong()
             val processRef = AtomicReference<Process?>(null)
@@ -822,6 +827,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     }
                 } else if (nativeCode == 143) {
                     onLog("<k> native was SIGTERMed (128+15)")
+                }
+                if (prebuiltBlob == null) {
+                    adviseAssumptions(config.assumptions, nativeCode, onLog)
                 }
                 nativeCode
             } finally {
@@ -1104,9 +1112,42 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
     }
 
+    /**
+     * Names the fields this run will trust without having measured them.
+     *
+     * Printed before the attack starts, because the useful moment to learn that
+     * the DRAM base is a guess is *before* reading a failure that otherwise
+     * looks like a geometry bug. Every line goes to the archive, so a report
+     * carries the profile's own doubt with it.
+     */
+    private fun logAssumptions(assumptions: List<Assumption>, log: (String) -> Unit) {
+        if (assumptions.isEmpty()) return
+        log(
+            "<k> profile assumptions (${assumptions.size}, not measured): " +
+                assumptions.joinToString(", ") { it.path },
+        )
+        assumptions.forEach { log("<k>   ${it.path} - ${it.consequence}") }
+    }
+
+    /**
+     * Restates them once the run has failed, and only for the failure that
+     * actually implicates them.
+     *
+     * Exit code 1 with a route that reported success is precisely the shape of
+     * a wrong assumption: the punch landed somewhere, and the target did not
+     * change. Codes 137/143 are a kill, which says nothing about the profile,
+     * so those stay quiet. Repeating the list last means the final screen a
+     * user sees answers "what do I check" instead of ending at
+     * "Write 1 failed".
+     */
+    private fun adviseAssumptions(assumptions: List<Assumption>, code: Int, log: (String) -> Unit) {
+        if (code != 1 || assumptions.isEmpty()) return
+        log("<k> the route completed but the write did not take effect; check these first:")
+        assumptions.forEach { log("<k>   ${it.path} - ${it.consequence}") }
+    }
+
     private fun importedOffsetsMatch(version: String): Boolean =
         userProfileStore.containsRelease(version)
-
     private fun importedOffsetsRecommendShizuku(version: String): Boolean =
         userProfileStore.recommendsShizuku(version)
 

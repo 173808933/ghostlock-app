@@ -67,6 +67,26 @@ data class ProfileFieldNode(
     val isGroup: Boolean get() = children.isNotEmpty()
 }
 
+/**
+ * One profile field that nobody measured on this kernel.
+ *
+ * A generated profile mixes three kinds of value: what kallsyms gave us, what
+ * a struct layout implies, and what a model guessed because the input image
+ * could not answer. All three used to look identical in the file, so a run
+ * that failed on a guess sent its owner looking for a geometry bug that was
+ * not there - the DRAM base is the usual culprit: it shifts *every* symbol at
+ * once, which is why a wrong one looks like "the punch lands nowhere".
+ *
+ * [consequence] states what breaks when the value is wrong, so the log line
+ * needs no further explanation.
+ */
+data class Assumption(
+    /** Dotted path exactly as the profile spells it. */
+    val path: String,
+    /** What a wrong value does to the run. */
+    val consequence: String,
+)
+
 /** Resolved execution view for the advanced editor (controller-owned). */
 data class ProfileConfig(
     val release: String,
@@ -83,6 +103,12 @@ data class ProfileConfig(
     val fallbackTo: String? = null,
     /** Dotted paths whose resolved value violates the geometry rules. */
     val invalidPaths: Set<String> = emptySet(),
+    /**
+     * Dotted paths whose resolved value is a default or a guess rather than a
+     * measurement of this kernel. Empty for a profile that states nothing and
+     * derives everything; see [Assumption] for why this is worth carrying.
+     */
+    val assumptions: List<Assumption> = emptyList(),
 ) {
     companion object {
         /** Routes a profile may declare ("" is the inference fallback). */

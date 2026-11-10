@@ -8,6 +8,7 @@ import com.ghostlock.app.data.profile.CpuPairView
 import com.ghostlock.app.data.profile.ProfileMerger
 import com.ghostlock.app.data.profile.ProfileResolver
 import com.ghostlock.app.data.route.RouteKind
+import com.ghostlock.app.domain.model.Assumption
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ProfileConfig
@@ -86,7 +87,67 @@ internal class AndroidProfileConfigController(
             punch = punch,
             fallbackTo = fallbackTo,
             invalidPaths = invalidPaths,
+            assumptions = assumptionsOf(full, route),
         )
+    }
+
+    /**
+     * Every field this run will trust without having measured it. Two sources,
+     * because a profile can be honest without saying so:
+     *
+     * - what the document declares under `confidence.assumed` (files generated
+     *   from here on carry it), and
+     * - what is missing entirely. An absent `kernel_phys_offset` is not a
+     *   neutral omission: native substitutes a compiled default, which is a
+     *   guess about *this* kernel. Detecting that here is what makes the
+     *   warning work for profiles authored before this convention existed.
+     */
+    private fun assumptionsOf(profile: ValueMap, route: String?): List<Assumption> {
+        val paths = declaredAssumptions(profile) + implicitAssumptions(profile, route)
+        return paths.distinct().sorted().map { Assumption(it, consequenceOf(it)) }
+    }
+
+    private fun declaredAssumptions(profile: ValueMap): List<String> =
+        profile["confidence"].asValueMap()?.get("assumed").asValueList()
+            ?.mapNotNull { it?.toString()?.trim() }
+            ?.filter { it.isNotEmpty() && it != "null" }
+            .orEmpty()
+
+    private fun implicitAssumptions(profile: ValueMap, route: String?): List<String> {
+        val assumed = mutableListOf<String>()
+        /* Both fall back to a compiled constant when absent (see
+         * KernelMisc in the native model: the optionals exist precisely so
+         * absence is distinguishable from a supplied 0). */
+        if (profile.getLongAt("kernel_phys_offset") == null) assumed += "kernel_phys_offset"
+        if (profile.getLongAt("kernel_phys_load") == null) assumed += "kernel_phys_load"
+        val geometryPath = when (route) {
+            "multicast_waiter" -> "route.multicast_waiter.waiter_off"
+            "select_stack" -> "route.select_stack.waiter_shift"
+            else -> null
+        }
+        if (geometryPath != null && profile.getLongAt(geometryPath) == null) {
+            assumed += geometryPath
+        }
+        return assumed
+    }
+
+    /** What a wrong value does, phrased for the log a user will paste. */
+    private fun consequenceOf(path: String): String = when {
+        path == "kernel_phys_offset" ->
+            "a wrong DRAM base shifts every symbol at once, so W1/W2 report a clean route and write an unrelated page"
+        path == "kernel_phys_load" ->
+            "a wrong physical load skews the direct-map alias the punch writes through"
+        path.endsWith(".waiter_off") || path.endsWith(".waiter_shift") ->
+            "the fake waiter lands at the wrong stack slot: the punch succeeds and nothing useful is written"
+        path.startsWith("cred.") ->
+            "the credential copy has the wrong shape, so W2 misses the capability run or overruns struct cred"
+        path.startsWith("kernelsnitch.") ->
+            "the mm_struct stride decides which pages the spray actually owns"
+        path.startsWith("offset.") || path.startsWith("task_struct.") ->
+            "a symbol or struct offset is off, so the write lands in an unrelated object"
+        path.startsWith("route.") ->
+            "the route geometry was not derived from this image"
+        else -> "the run trusts a value it never measured"
     }
 
     /**

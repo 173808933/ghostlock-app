@@ -244,32 +244,44 @@ fn run(cli: &Cli) -> Result<i32> {
             || matches!((major, minor), (Some(5), Some(minor)) if minor < 10);
         if too_old {
             let message = "内核低于 5.10：KernelSU late-load 没有对应 KMI";
-            if cli.analysis || cli.analysis_json.is_some() {
-                let json = serde_json::json!({
-                    "tool": "ghostlock-extract",
-                    "release": &release,
-                    "kernel_major": major,
-                    "kernel_minor": minor,
-                    "punch": "none",
-                    "routes": [],
-                    "verdict": {"level": "unusable", "reasons": [message]},
-                })
-                .to_string();
-                if let Some(path) = cli.analysis_json.as_ref() {
-                    std::fs::write(path, &json)
-                        .map_err(|err| ExtractError::new(format!("cannot write analysis json: {err}")))?;
-                }
-                if cli.analysis {
-                    if let Some(out) = cli.out.as_ref() {
-                        std::fs::write(out, &json)
-                            .map_err(|err| ExtractError::new(format!("{err}")))?;
-                    } else {
-                        println!("{json}");
+            /* Analysis is read-only, so the version floor cannot make it
+             * wrong - it only rules out *emitting a profile*. Refusing to look
+             * at an old kernel at all means the one question a 4.x owner has
+             * ("is the primitive still there?") goes unanswered, and the
+             * analysis already knows how to phrase the version limit as a
+             * verdict reason. Profiles stay refused below. */
+            let analysis_only = (cli.analysis || cli.analysis_json.is_some())
+                && cli.format != "conf";
+            if !analysis_only {
+                if cli.analysis || cli.analysis_json.is_some() {
+                    let json = serde_json::json!({
+                        "tool": "ghostlock-extract",
+                        "release": &release,
+                        "kernel_major": major,
+                        "kernel_minor": minor,
+                        "punch": "none",
+                        "routes": [],
+                        "verdict": {"level": "unusable", "reasons": [message]},
+                    })
+                    .to_string();
+                    if let Some(path) = cli.analysis_json.as_ref() {
+                        std::fs::write(path, &json).map_err(|err| {
+                            ExtractError::new(format!("cannot write analysis json: {err}"))
+                        })?;
+                    }
+                    if cli.analysis {
+                        if let Some(out) = cli.out.as_ref() {
+                            std::fs::write(out, &json)
+                                .map_err(|err| ExtractError::new(format!("{err}")))?;
+                        } else {
+                            println!("{json}");
+                        }
                     }
                 }
+                eprintln!("error: {message} ({release})");
+                return Ok(2);
             }
-            eprintln!("error: {message} ({release})");
-            return Ok(2);
+            eprintln!("note: {message} ({release}); reporting what the image shows");
         }
     }
 

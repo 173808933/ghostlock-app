@@ -615,26 +615,24 @@ pub fn render_json(analysis: &Analysis) -> String {
         (Some(5), Some(minor)) if minor < 10 => true,
         _ => false,
     };
-    let (level, mut reasons) = if patched {
-        (
-            "unusable",
-            vec!["remove_waiter 已修补，CVE-2026-43499 不存在".to_string()],
-        )
-    } else if too_old {
-        (
-            "unusable",
-            vec!["内核低于 5.10：KernelSU late-load 没有对应 KMI".to_string()],
-        )
+    /* Both limits can hold at once - a 4.x vendor kernel may also carry a
+     * backport - and reporting only the first hides the decisive one. A user
+     * who reads "低于 5.10" asks about a port; one who reads "已修补" stops. */
+    let mut reasons: Vec<String> = Vec::new();
+    if patched {
+        reasons.push("remove_waiter 已修补，CVE-2026-43499 不存在".to_string());
+    }
+    if too_old {
+        reasons.push("内核低于 5.10：KernelSU late-load 没有对应 KMI".to_string());
+    }
+    let level = if patched || too_old {
+        "unusable"
     } else if sigret_feasible {
-        (
-            "usable",
-            vec!["rt_sigreturn 写入窗口覆盖 futex waiter".to_string()],
-        )
+        reasons.push("rt_sigreturn 写入窗口覆盖 futex waiter".to_string());
+        "usable"
     } else {
-        (
-            "risky",
-            vec!["sigret 不可行；需按官方路线（tcp / multicast / pselect）实测".to_string()],
-        )
+        reasons.push("sigret 不可行；需按官方路线（tcp / multicast / pselect）实测".to_string());
+        "risky"
     };
     if analysis.phys.is_none() && level != "unusable" {
         reasons.push("缺少 kernel_phys_load：未能从镜像证实物理加载地址".to_string());
