@@ -12,6 +12,13 @@ import android.content.Context
  * the generated profile) so that an unverified blob can never reach a device
  * that never produced it.
  *
+ * Exception, marked in `DERIVED_RELEASES`: a release may be bundled when the
+ * profile was auto-derived from that exact build's own Image (OTA -> boot.img
+ * -> `pc-tools/auto.py`) and `remove_waiter` was independently disassembled to
+ * confirm the CVE is unpatched there. Such an entry has the right geometry for
+ * the build but has not been executed on hardware yet; it is a starting point,
+ * not a calibration.
+ *
  * For The prebuilt blob is the exact profile that was calibrated on hardware:
  *
  *   magic 0x0D000721, version 2, frontend 1, backend 1, route 3
@@ -34,6 +41,16 @@ object PrebuiltProfiles {
 
     /** Release string of the reference device this build was verified on. */
     const val VERIFIED_RELEASE: String = "6.1.141-android14-11-o-g984c12362a16"
+
+    /**
+     * Bundled releases whose blob was auto-derived from that build's own Image
+     * and confirmed unpatched by disassembly, but never executed on hardware.
+     * Geometry is trustworthy; the tuned execution.* timings are inherited
+     * defaults, so treat a first run as a probe rather than a calibration.
+     */
+    val DERIVED_RELEASES: Set<String> = setOf(
+        "6.1.141-android14-11-o-g26210cc00778",
+    )
 
     /** Device-verified GLK1 v2 blob for [release], or null when not bundled. */
     fun prebuiltBlob(context: Context, release: String): ByteArray? {

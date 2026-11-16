@@ -180,7 +180,10 @@ internal class AndroidProfileConfigController(
 
         requireNonZero(*RouteCommonRequired.toTypedArray())
         val major = value("kernel_major")
-        if (major != 5L && major != 6L) invalid += "kernel_major"
+        /* 4.x is accepted for the EOL 4.19 line: its rt_mutex_waiter layout and
+         * the sigret punch window are both present (derived on Find X3), so the
+         * same profile schema applies. Anything outside 4..6 is still rejected. */
+        if (major == null || major < 4L || major > 6L) invalid += "kernel_major"
 
         val copySize = value("cred.copy_size")
         if (copySize == null || copySize == 0L) invalid += "cred.copy_size"
