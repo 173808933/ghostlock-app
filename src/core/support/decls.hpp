@@ -64,6 +64,11 @@ namespace ghostlock::support {
 
     uintptr_t prepare_good_kernel_page(const ghostlock::memory::WriteRequest &request);
 
+    /* Append a line to a persistent marker file and fsync it. A panic takes the
+ * console log with it (pstore is unreadable from the shell domain), so the
+ * last marker on disk is the only way to tell how far the kernel got. */
+    void progress_marker(const char *tag);
+
     /* W2D: yield the PI/futex subsystem back to a quiet state between the W2
      * prebuild collision scan and the main write's second scan. See the call
      * site in the 43499 backend for why two scans run back to back. */

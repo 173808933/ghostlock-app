@@ -59,9 +59,14 @@ HDRS := $(wildcard core/*.h core/*.hpp core/*/*.h core/*/*.hpp)
 # Device offsets are selected at runtime from uname -r.
 TARGET_CONFIG ?= kernel/target.h
 
+# Extra compile-time switches, e.g. EXTRA_FLAGS=-DGHOSTLOCK_VA39 for the
+# arm64 4.19 (VA_BITS=39) address layout. Empty keeps every existing target
+# byte-identical.
+EXTRA_FLAGS ?=
+
 COMMON_FLAGS := -O2 -flto -Wall -Wextra -Wconversion -Wsign-conversion \
   -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
-  -Icore -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\"
+  -Icore -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\" $(EXTRA_FLAGS)
 CFLAGS := $(COMMON_FLAGS) -std=gnu11
 CXXFLAGS := $(COMMON_FLAGS) -std=c++23 -fno-rtti
 LDFLAGS := -fPIE -pie -pthread -flto -static-libstdc++

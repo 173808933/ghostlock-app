@@ -24,6 +24,9 @@ namespace ghostlock::route {
     RouteStatus do_tcp_fake_lock_route(const ghostlock::memory::WriteRequest *request);
 
     RouteStatus do_kernel5_fake_lock_route(const ghostlock::memory::WriteRequest *request);
+
+    /* Stamp the calling thread's futex frame before it parks (pre-arm). */
+    bool punch_stack_here(const unsigned char *buf, std::size_t len);
 } // namespace ghostlock::route
 
 #endif

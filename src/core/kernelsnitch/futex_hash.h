@@ -153,6 +153,10 @@ namespace ghostlock::kernelsnitch {
 
 #define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = 0ULL } }
 
+/* kernel/futex.c reference bits carried in key->both.offset */
+#define FUT_OFF_INODE    1
+#define FUT_OFF_MMSHARED 2
+
     typedef union {
         struct {
             uint64_t i_seq;
@@ -249,7 +253,21 @@ namespace ghostlock::kernelsnitch {
         futex_key_t key = {};
         key.private_key.mm = (void *) mm;
         key.private_key.address = addr & ~static_cast<size_t>(0xfff);
+        /* get_futex_key() finishes the private key with
+     * `key->both.offset |= FUT_OFF_MMSHARED` (2) before hashing, and that
+     * offset is the jhash initval - dropping the bit shifts every bucket.
+     * PEDM00 4.19 disassembly: `ldr w8,[x19,#0x10] / orr w8,w8,#2 /
+     * str w8,[x19,#0x10]` right after `stp x22,x20,[x19]`.
+     *
+     * Only applied to the VA39 build: the 6.x path is calibrated and verified
+     * on hardware with the plain offset, and changing its bucket function
+     * would silently invalidate every existing profile. Enable it there only
+     * after re-verifying a leak on a 6.x device. */
+#if defined(GHOSTLOCK_VA39)
+        key.private_key.offset = (addr & 0xfff) | FUT_OFF_MMSHARED;
+#else
         key.private_key.offset = addr & 0xfff;
+#endif
         return futex_hash_context_key(context, &key);
     }
 } // namespace ghostlock::kernelsnitch

