@@ -49,6 +49,7 @@ Sorted by kernel version (major.minor.patch), ascending. Rows with the same vers
 | `6.1.138-android14-11-g965475777129-mi`                | REDMI K80                                                        |
 | `6.1.138-android14-11-g2ecae636cf9b-ab14676408`        | Lenovo Yoga Tab Plus (TB520FU)                                   |
 | `6.1.138-android14-11-g51f8c580613d-ab13911623`        | Redmi Note 14 Pro 5G / POCO X7                                   |
+| `6.1.138-android14-11-g7b9e94e37cfa-mi`                | Xiaomi Pad 7 Pro                                                 |
 | `6.1.145-android14-11-g09f1c0074ad7-ab14226177`        | Infinix Note 50s 5G, Infinix GT 30 (X6876)                       |
 | `6.1.145-android14-11-g11c274d0441f-ab14259673`        | RedMagic 9(S) Pro (REDMAGICOS11.0.5MR1_GB)                       |
 | `6.1.145-android14-11-g74d1702dab4d-ab14669069`        | vivo T4, IQOO 12                                                 |
@@ -75,6 +76,7 @@ Sorted by kernel version (major.minor.patch), ascending. Rows with the same vers
 | `6.6.89-android15-8-gb99b4586a3ee-ab13754593-4k`       | Honor Magic V5 (9.0.1.160)                                       |
 | `6.6.89-android15-8-g5a0ffb447c1d-ab13771415-4k`       | Redmi 15C 4G / POCO C85 4G                                       |
 | `6.6.89-android15-8-gf4dc45704e54-abogki446052083-4k`  | OnePlus 13                                                       |
+| `6.6.89-android15-8-g6bf8136549d7-abogki463261049-4k`  | iQOO 13 (V2408A / PD2408)                                        |
 | `6.6.92-android15-8-g3637f4904cf5-ab13944661-4k`       | Red Magic Tablet 3 Pro, Red Magic 10 Pro, Red Magic 11 Air       |
 | `6.6.102-android15-8-gab8eb70a71b8-ab14350911-4k`      | Nothing Phone 3                                                  |
 | `6.6.102-android15-8-gb01b41c2647c-ab15574720-4k`      | Xiaomi 17T                                                       |
