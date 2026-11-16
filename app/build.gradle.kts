@@ -16,18 +16,41 @@ layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("app"))
 val appName = "GhostLock"
 val appVersionName = "1.2"
 
+/* versionCode = number of commits on HEAD, so every build is installable over
+ * the previous one.  Gradle runs as a Windows process and its PATH does not
+ * necessarily contain git (the build is often driven from a shell whose PATH
+ * is POSIX-only), and the previous fallback silently pinned 583 forever -
+ * every APK shipped as the same version.  Probe a few known locations before
+ * giving up, and fall back to a value derived from the previous commit count so
+ * an offline build still increments. */
+val gitExecutable: String? = run {
+    val candidates = listOfNotNull(
+        System.getenv("GIT_EXECUTABLE"),
+        "git",
+        "C:/Other/WorkBuddy/resources/vendor/PortableGit/mingw64/bin/git.exe",
+        "C:/Program Files/Git/bin/git.exe",
+    )
+    candidates.firstOrNull { candidate ->
+        runCatching {
+            providers.exec { commandLine(candidate, "--version") }
+                .result.get().exitValue == 0
+        }.getOrDefault(false)
+    }
+}
+
 val gitVersionCode = runCatching {
+    requireNotNull(gitExecutable) { "git not found" }
     providers.exec {
-        commandLine("git", "rev-list", "--count", "HEAD")
+        commandLine(gitExecutable, "rev-list", "--count", "HEAD")
     }.standardOutput.asText.get().trim().toInt()
 }.getOrElse {
-    /* No git checkout, so the upstream commit count is unavailable.
-     * Pin the baseline instead of "1": this fork is built on upstream 583
-     * (commit 5d675e2) plus the device-verified device additions, and the
-     * number is what the release page and the in-app status line compare. */
-    logger.warn("git rev-list failed (${it.message}); versionCode pinned to baseline 583")
-    583
+    /* No git at all: fall back to the checkout's known count plus a time-based
+     * bump, so consecutive offline builds never collide. */
+    val fallback = 583 + ((System.currentTimeMillis() / 60000L) % 100000L).toInt()
+    logger.warn("git rev-list unavailable (${it.message}); versionCode=$fallback (time-derived)")
+    fallback
 }
+logger.lifecycle("GhostLock versionCode=$gitVersionCode (git=$gitExecutable)")
 
 val buildInfoSrc = layout.buildDirectory.dir("generated/source/buildInfo")
 
