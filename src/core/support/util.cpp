@@ -178,6 +178,36 @@ namespace ghostlock::support {
                    (unsigned long long) ghostlock::profile::slide_init_task(),
                    (unsigned long long) ghostlock::profile::slide_root_task_group(),
                    (unsigned long long) ghostlock::profile::slide_sysctl_bootid());
+        /* Kernel-stack randomisation breaks every punch whose geometry is a
+         * fixed offset from the syscall's stack base: CONFIG_RANDOMIZE_KSTACK
+         * OFFSET shifts sp by a random 16-byte multiple (0..0x7f0) on each
+         * syscall entry, so the futex frame and the sigreturn frame no longer
+         * share a base.  The offset itself is not readable from userspace, but
+         * the switch that enables it is visible on the kernel command line -
+         * report it so a failed punch is attributable instead of mysterious. */
+        {
+            std::array<char, 1024> cmdline{};
+            int32_t fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+            ssize_t got = -1;
+            if (fd >= 0) {
+                got = read(fd, cmdline.data(), cmdline.size() - 1);
+                close(fd);
+            }
+            const char *state = "unreadable";
+            if (got > 0) {
+                cmdline[static_cast<size_t>(got)] = '\0';
+                const char *hit = strstr(cmdline.data(), "randomize_kstack_offset");
+                if (hit) {
+                    state = strstr(hit, "=off") ? "off" : "on";
+                } else {
+                    /* No override on the command line: the compiled default
+                     * decides, and a vendor that ships it enabled is exactly
+                     * the case this line exists to expose. */
+                    state = "absent (default decides; if punches miss, assume on)";
+                }
+            }
+            pr_success("punch geometry pid=%d kstack_randomize=%s\n", getpid(), state);
+        }
         /* Everything above is the last thing a run that dies during setup ever
          * prints. Without a sync here those lines exist only in the page cache,
          * and a panic leaves a file with the right size and no content. */
